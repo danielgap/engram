@@ -14,7 +14,11 @@ This is the complete technical reference for Engram. For getting started, see th
 | --------------------------------------------------------- | ------------------------------------------------------------ |
 | [Database Schema](#database-schema)                       | Tables, FTS5, SQLite config                                  |
 | [HTTP API](#http-api-endpoints)                           | All REST endpoints with request/response details             |
-| [MCP Tools](#mcp-tools-22-tools)                          | Detailed reference for all 22 memory tools                   |
+
+| [MCP Tools](#mcp-tools-23-tools)                          | Detailed reference for all 22 memory tools                   |
+
+| [MCP Tools](#mcp-tools-23-tools)                          | Detailed reference for all 23 memory tools                   |
+
 | [MCP Project Resolution](#mcp-project-resolution)         | Auto-detection algorithm, response envelope, tool categories |
 | [Memory Protocol](#memory-protocol)                       | When/how agents should use the tools                         |
 | [Project Name Normalization](#project-name-normalization) | Auto-detection, normalization, similar-project warnings      |
@@ -859,7 +863,11 @@ Returns success even when cwd is ambiguous — empty `project` + non-empty `avai
 
 ---
 
+
 ## MCP Tools (22 tools)
+
+## MCP Tools (23 tools)
+
 
 ### mem_search
 
@@ -987,9 +995,13 @@ Extract structured learnings from text output. Looks for `## Key Learnings:` sec
 **Admin tool.** Merge multiple project name variants into a single canonical name. Requires `from` as a comma-separated list of source project names and `to` as the target canonical name. All observations, sessions, and prompts from the source projects are reassigned to the canonical project.
 
 ### mem_current_project
-
+    
 Detect the current project from the working directory. Returns `project`, `project_source`, `project_path`, `cwd`, `available_projects`, and `warning`. Never returns an error — even on ambiguous cwd it returns success with an empty `project` and non-empty `available_projects`. Recommended as the first call when starting a session.
-
+    
+### mem_list_projects
+    
+List every project known to Engram with per-project `observation_count`, `session_count`, `prompt_count`, and known `directories`, ordered by observation count descending — the same view as `engram projects list`. Returns `{ "projects": [...], "count": N }` and never errors; an empty store returns a successful empty list. Use it for cross-project discovery when the working directory matches no known project, then scope `mem_search`/`mem_context` to the chosen project.
+    
 ### mem_doctor
 
 Run read-only operational diagnostics. Returns the same JSON report shape as `engram doctor --json`, with optional `project` and `check` filters. The optional `project` override is validated with read-project resolution before diagnostics run.

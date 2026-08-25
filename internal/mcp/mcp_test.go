@@ -2419,6 +2419,7 @@ func TestResolveToolsAgentProfile(t *testing.T) {
 		"mem_review",          // lifecycle review list/maintenance
 		"mem_pin",             // local context priority
 		"mem_unpin",           // local context priority
+		"mem_list_projects",   // engram#675: enumerate known projects for cross-project discovery
 	}
 	for _, tool := range expectedTools {
 		if !result[tool] {
@@ -9485,5 +9486,109 @@ func TestHandleUpdateRejectsBlankTitleWithoutSideEffects(t *testing.T) {
 				t.Fatalf("rejected update enqueued a mutation: got %d, want %d", got, mutationsBefore)
 			}
 		})
+	}
+}
+
+// ─── mem_list_projects (engram#675) ─────────────────────────────────────
+
+// TestMemListProjects_Registered: the discovery tool must be in the agent
+// profile so agent sessions can enumerate known projects (engram#675).
+func TestMemListProjects_Registered(t *testing.T) {
+	if !ProfileAgent["mem_list_projects"] {
+		t.Fatalf("mem_list_projects must be registered in ProfileAgent")
+	}
+	srv := NewServer(newMCPTestStore(t))
+	if srv.ListTools()["mem_list_projects"] == nil {
+		t.Fatalf("NewServer must register mem_list_projects")
+	}
+}
+
+// TestMemListProjects_ReturnsProjectsWithStats: the MCP view must list every
+// known project from the same store query as `engram projects list`, with the
+// per-project counts, ordered by observation count descending (engram#675).
+func TestMemListProjects_ReturnsProjectsWithStats(t *testing.T) {
+	s := newMCPTestStore(t)
+	seed := func(sessID, project, dir string, obs int) {
+		t.Helper()
+		if _, err := s.DB().Exec(
+			`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`,
+			sessID, project, dir,
+		); err != nil {
+			t.Fatalf("insert session: %v", err)
+		}
+		for i := 0; i < obs; i++ {
+			if _, err := s.DB().Exec(`
+				INSERT INTO observations (session_id, type, title, content, project, scope)
+				VALUES (?, 'bugfix', ?, ?, ?, 'project')`,
+				sessID, "t-"+project, "c", project,
+			); err != nil {
+				t.Fatalf("insert observation: %v", err)
+			}
+		}
+	}
+	seed("sess-alpha", "alpha-project", "/tmp/alpha", 3)
+	seed("sess-beta", "beta-project", "/tmp/beta", 1)
+
+	h := handleListProjects(s)
+	res, err := h(context.Background(), mcppkg.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", callResultText(t, res))
+	}
+
+	var envelope struct {
+		Count    int `json:"count"`
+		Projects []struct {
+			Name             string `json:"name"`
+			ObservationCount int    `json:"observation_count"`
+			SessionCount     int    `json:"session_count"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal([]byte(callResultText(t, res)), &envelope); err != nil {
+		t.Fatalf("unmarshal envelope: %v\n%s", err, callResultText(t, res))
+	}
+	if envelope.Count != 2 || len(envelope.Projects) != 2 {
+		t.Fatalf("expected 2 projects, got count=%d len=%d: %s",
+			envelope.Count, len(envelope.Projects), callResultText(t, res))
+	}
+	byName := map[string]int{}
+	for _, p := range envelope.Projects {
+		byName[p.Name] = p.ObservationCount
+	}
+	if byName["alpha-project"] != 3 || byName["beta-project"] != 1 {
+		t.Fatalf("expected alpha=3 beta=1 observations, got %v", byName)
+	}
+	// Same ordering contract as `engram projects list`: observations desc.
+	if envelope.Projects[0].Name != "alpha-project" {
+		t.Fatalf("expected observation-count-descending order, got %q first",
+			envelope.Projects[0].Name)
+	}
+}
+
+// TestMemListProjects_EmptyStoreIsSuccess: an empty store is a successful
+// empty listing, never an error — discovery must not fail for new users.
+func TestMemListProjects_EmptyStoreIsSuccess(t *testing.T) {
+	h := handleListProjects(newMCPTestStore(t))
+	res, err := h(context.Background(), mcppkg.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("empty store must be a success, got: %s", callResultText(t, res))
+	}
+	var envelope struct {
+		Count    int `json:"count"`
+		Projects []struct {
+			Name string `json:"name"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal([]byte(callResultText(t, res)), &envelope); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if envelope.Count != 0 || len(envelope.Projects) != 0 {
+		t.Fatalf("expected empty success listing, got count=%d len=%d",
+			envelope.Count, len(envelope.Projects))
 	}
 }
