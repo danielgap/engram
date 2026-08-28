@@ -858,9 +858,11 @@ func (s *Store) Close() error {
 //
 // Gate semantics (runStartupMigrations):
 //   - user_version == schemaVersion → schema is current; skip migrate()
-//     entirely (fast, read-only startup).
+//     entirely (fast, read-only startup). runStartupMaintenance still runs:
+//     convergent, idempotent hygiene (deferred payload identity, cloud
+//     upgrade snapshot redaction) must not be gated by a version marker.
 //   - user_version <  schemaVersion → run migrate() under an exclusive
-//     inter-process lock, then stamp user_version.
+//     inter-process lock, then stamp user_version, then run maintenance.
 //   - user_version >  schemaVersion → database was migrated by a newer engram;
 //     warn and skip (never run old migrations against a newer schema).
 const schemaVersion = 1
@@ -870,9 +872,11 @@ const schemaVersion = 1
 // user_version gate skips migrations on already-current databases.
 var migrateRunCount atomic.Int64
 
-// runStartupMigrations runs migrate() exactly once per schema generation.
-// Enrolled-project repair remains deferred until the first synchronization
-// operation, matching the current Store lifecycle.
+// runStartupMigrations runs migrate() exactly once per schema generation;
+// runStartupMaintenance converges on every open unless the database was
+// stamped by a newer engram (fail closed). Enrolled-project repair remains
+// deferred until the first synchronization operation, matching the current
+// Store lifecycle.
 //
 // Exclusivity is provided by an advisory file lock (acquireMigrationLock)
 // on <DataDir>/.migrate.lock rather than by one giant BEGIN IMMEDIATE
@@ -930,8 +934,69 @@ func (s *Store) runStartupMigrations() error {
 // after the schema version is current. It is never run by an older binary
 // against a database stamped with a newer schema version.
 func (s *Store) runStartupMaintenance() error {
+	if err := s.convergeDeferredPayloadIdentity(); err != nil {
+		return fmt.Errorf("engram: converge deferred payload identity: %w", err)
+	}
 	if err := s.redactCloudUpgradeSnapshots(); err != nil {
 		return fmt.Errorf("engram: redact cloud upgrade snapshots: %w", err)
+	}
+	return nil
+}
+
+// convergeDeferredPayloadIdentity adds and backfills sync_apply_deferred
+// .payload_sync_id on EVERY open (maintenance path), including opens whose
+// user_version already equals schemaVersion and therefore skip migrate().
+// payload_sync_id records the entity identity the row's own payload claims,
+// which is not always the key the row is stored under. The success-path
+// cleanup needs that identity, and reading it from a stored column keeps a
+// JSON extract out of the apply write transaction. It stays blank for payloads
+// that carry no sync_id of their own — pulled session payloads are keyed on
+// `id`, and an undecodable payload has no identity at all, which is itself one
+// of the reasons its row is dead.
+//
+// The column add and this backfill must converge on every open rather than
+// only in the open that added the column. They are separate auto-committed
+// statements, so a transient SQLITE_BUSY, an I/O error, or the process dying
+// between them leaves a database whose column exists while every legacy row is
+// still blank. An open that derived only what it had just added would skip
+// such a database forever, and a schema-version marker advanced past this
+// point would skip it too — which is why this lives in maintenance, outside
+// the version gate. It is also what repairs rows an older binary writes into
+// the same database once the column exists. That matters beyond migration
+// hygiene: a blank identity is what lets relationApplyCleanupSQL delete a row
+// by the key it is stored under, so a blank that means "not yet derived" is a
+// route to deleting evidence about a different relation.
+//
+// Running it unconditionally is cheap because it converges. The two equality
+// terms are the exact leading prefix of idx_sad_payload_sync(payload_sync_id,
+// entity), so this is a point lookup rather than a scan of the backlog, and the
+// CASE excludes every row whose identity cannot be derived — after one
+// successful run no row matches at all. CASE is used instead of a
+// `json_valid(...) AND json_extract(...)` conjunction because only CASE
+// guarantees the extract is never evaluated for a payload that is not valid
+// JSON. The value is trimmed so a derived identity is byte-identical to the one
+// recordRelationApplyFailureTx stores for the same payload.
+func (s *Store) convergeDeferredPayloadIdentity() error {
+	if err := s.addColumnIfNotExists("sync_apply_deferred", "payload_sync_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("add payload_sync_id: %w", err)
+	}
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_sad_payload_sync
+			ON sync_apply_deferred(payload_sync_id, entity);
+	`); err != nil {
+		return fmt.Errorf("index idx_sad_payload_sync: %w", err)
+	}
+	if _, err := s.execHook(s.db, `
+		UPDATE sync_apply_deferred
+		SET payload_sync_id = trim(json_extract(payload, '$.sync_id'))
+		WHERE payload_sync_id = ''
+		  AND entity = 'relation'
+		  AND CASE
+			WHEN json_valid(payload) THEN trim(ifnull(json_extract(payload, '$.sync_id'), ''))
+			ELSE ''
+		  END <> ''
+	`); err != nil {
+		return fmt.Errorf("backfill payload_sync_id: %w", err)
 	}
 	return nil
 }
@@ -1395,14 +1460,10 @@ func (s *Store) migrate() error {
 		{name: "reason_code", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "project", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "scope_class", definition: "TEXT NOT NULL DEFAULT 'legacy_unscoped'"},
-		// payload_sync_id records the entity identity the row's own payload
-		// claims, which is not always the key the row is stored under. The
-		// success-path cleanup needs that identity, and reading it from a stored
-		// column keeps a JSON extract out of the apply write transaction. It stays
-		// blank for payloads that carry no sync_id of their own — pulled session
-		// payloads are keyed on `id`, and an undecodable payload has no identity
-		// at all, which is itself one of the reasons its row is dead.
-		{name: "payload_sync_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		// payload_sync_id is NOT added here: it converges on every open via
+		// runStartupMaintenance → convergeDeferredPayloadIdentity, because a
+		// version-gated add would skip databases the backfill still needs to
+		// repair (see the comment there).
 	}
 	for _, c := range deferredColumns {
 		if err := s.addColumnIfNotExists("sync_apply_deferred", c.name, c.definition); err != nil {
@@ -1412,45 +1473,6 @@ func (s *Store) migrate() error {
 	if _, err := s.execHook(s.db, `
 		CREATE INDEX IF NOT EXISTS idx_sad_scope_status_seen
 			ON sync_apply_deferred(target_key, project, apply_status, first_seen_at);
-		CREATE INDEX IF NOT EXISTS idx_sad_payload_sync
-			ON sync_apply_deferred(payload_sync_id, entity);
-	`); err != nil {
-		return err
-	}
-	// Rows written before payload_sync_id existed carry their relation identity
-	// only inside the payload, so derive it here rather than parsing JSON on every
-	// apply.
-	//
-	// This runs on every open rather than only in the open that added the column.
-	// The ALTER above and this UPDATE are separate auto-committed statements, so a
-	// transient SQLITE_BUSY, an I/O error, or the process dying between them leaves
-	// a database whose column exists while every legacy row is still blank. An open
-	// that derived only what it had just added would skip such a database forever,
-	// and a schema-version marker advanced past this point would skip it too. It is
-	// also what repairs rows an older binary writes into the same database once the
-	// column exists. That matters beyond migration hygiene: a blank identity is
-	// what lets relationApplyCleanupSQL delete a row by the key it is stored under,
-	// so a blank that means "not yet derived" is a route to deleting evidence about
-	// a different relation.
-	//
-	// Running it unconditionally is cheap because it converges. The two equality
-	// terms are the exact leading prefix of idx_sad_payload_sync(payload_sync_id,
-	// entity), so this is a point lookup rather than a scan of the backlog, and the
-	// CASE excludes every row whose identity cannot be derived — after one
-	// successful run no row matches at all. CASE is used instead of a
-	// `json_valid(...) AND json_extract(...)` conjunction because only CASE
-	// guarantees the extract is never evaluated for a payload that is not valid
-	// JSON. The value is trimmed so a derived identity is byte-identical to the one
-	// recordRelationApplyFailureTx stores for the same payload.
-	if _, err := s.execHook(s.db, `
-		UPDATE sync_apply_deferred
-		SET payload_sync_id = trim(json_extract(payload, '$.sync_id'))
-		WHERE payload_sync_id = ''
-		  AND entity = 'relation'
-		  AND CASE
-			WHEN json_valid(payload) THEN trim(ifnull(json_extract(payload, '$.sync_id'), ''))
-			ELSE ''
-		  END <> ''
 	`); err != nil {
 		return err
 	}

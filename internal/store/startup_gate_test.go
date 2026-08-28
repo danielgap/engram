@@ -56,6 +56,58 @@ func TestPersistentWALSurvivesClose(t *testing.T) {
 	}
 }
 
+
+// TestMaintenanceConvergesWithoutRerunningMigrations pins the hybrid split
+// contract: a stamped-current database still converges deferred payload
+// identities on reopen via runStartupMaintenance, WITHOUT re-running the
+// gated migrate() suite.
+func TestMaintenanceConvergesWithoutRerunningMigrations(t *testing.T) {
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+
+	s1, err := New(cfg)
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	if err := s1.CreateSession("ses-hybrid", "proj-hybrid", cfg.DataDir); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	_, syncA := addTestObsSession(t, s1, "ses-hybrid", "Obs A hybrid", "decision", "proj-hybrid", "project")
+	_, syncB := addTestObsSession(t, s1, "ses-hybrid", "Obs B hybrid", "decision", "proj-hybrid", "project")
+	payload := relationPayloadJSON(t, "rel-hybrid", syncA, syncB)
+	if _, err := s1.db.Exec(`
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, target_key, project, scope_class, entity_key, op, payload_sync_id, apply_status, retry_count, first_seen_at)
+		VALUES ('', 'relation', ?, ?, 'proj-hybrid', 'scoped', '', '', '', 'dead', 0, datetime('now'))
+	`, payload, DefaultSyncTargetKey); err != nil {
+		t.Fatalf("insert legacy dead row: %v", err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	countAfterFirst := migrateRunCount.Load()
+
+	s2, err := New(cfg)
+	if err != nil {
+		t.Fatalf("reopen New: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	var backfilled string
+	if err := s2.db.QueryRow(
+		`SELECT payload_sync_id FROM sync_apply_deferred WHERE entity = 'relation'`,
+	).Scan(&backfilled); err != nil {
+		t.Fatalf("read converged identity: %v", err)
+	}
+	if backfilled != "rel-hybrid" {
+		t.Fatalf("payload_sync_id after reopen = %q, want %q (maintenance must converge)", backfilled, "rel-hybrid")
+	}
+	if got := migrateRunCount.Load(); got != countAfterFirst {
+		t.Fatalf("migrate() re-ran on stamped-current reopen (count %d → %d): convergence must come from maintenance, not the gated suite", countAfterFirst, got)
+	}
+}
+
 func TestUserVersionGateSkipsSecondOpen(t *testing.T) {
 	cfg := mustDefaultConfig(t)
 	cfg.DataDir = t.TempDir()
@@ -98,9 +150,18 @@ func TestUserVersionGateSkipsSecondOpen(t *testing.T) {
 	}
 }
 
+// TestSchemaVersionTracksMigrationBody pins the migrate() body per
+// schemaVersion. With the hybrid split, migrate() carries the destructive,
+// check-then-act suite (FTS topic_key, sync_chunks, legacy observations
+// rebuilds plus the base schema): changing IT without bumping schemaVersion
+// would silently skip the change on already-stamped databases, so its AST
+// fingerprint must change with the version. Convergent, idempotent statements
+// (column adds, IF NOT EXISTS indexes, the payload_sync_id backfill) live in
+// runStartupMaintenance and intentionally have NO fingerprint: they run on
+// every open and need no version bump by design.
 func TestSchemaVersionTracksMigrationBody(t *testing.T) {
 	fingerprints := map[int]string{
-		1: "5fb0278991365e19d46168d747bf1c50482a1b22829e2d59a0341f36fc67e4b3",
+		1: "dc3f85f60d59524654df97429156c094c5f492d9dc138f50a6549c08f6504079",
 	}
 	want, ok := fingerprints[schemaVersion]
 	if !ok {
