@@ -851,9 +851,9 @@ func (s *Store) Close() error {
 // ─── Migrations ──────────────────────────────────────────────────────────────
 
 // schemaVersion is the store schema generation recorded in SQLite's
-// PRAGMA user_version. Version 1 corresponds to the fully-migrated v1.19.0
-// schema (the current migrate() suite). Bump this constant whenever migrate()
-// gains a new step so that databases stamped with an older version run the
+// PRAGMA user_version. Version 1 is the fully migrated schema at introduction,
+// fingerprinted by TestSchemaVersionTracksMigrationBody. Bump this constant
+// whenever migrate() changes so databases stamped with an older version run the
 // suite again on next startup.
 //
 // Gate semantics (runStartupMigrations):
@@ -889,6 +889,9 @@ func (s *Store) runStartupMigrations() error {
 		return fmt.Errorf("engram: read user_version: %w", err)
 	}
 	if shouldSkipMigrations(current) {
+		if current == schemaVersion {
+			return s.runStartupMaintenance()
+		}
 		return nil
 	}
 
@@ -905,6 +908,9 @@ func (s *Store) runStartupMigrations() error {
 		return fmt.Errorf("engram: re-read user_version: %w", err)
 	}
 	if shouldSkipMigrations(current) {
+		if current == schemaVersion {
+			return s.runStartupMaintenance()
+		}
 		return nil
 	}
 
@@ -916,6 +922,16 @@ func (s *Store) runStartupMigrations() error {
 	// retried on the next startup (migrate() is idempotent).
 	if err := s.setUserVersion(schemaVersion); err != nil {
 		return fmt.Errorf("engram: set user_version: %w", err)
+	}
+	return s.runStartupMaintenance()
+}
+
+// runStartupMaintenance applies idempotent data hygiene that must remain active
+// after the schema version is current. It is never run by an older binary
+// against a database stamped with a newer schema version.
+func (s *Store) runStartupMaintenance() error {
+	if err := s.redactCloudUpgradeSnapshots(); err != nil {
+		return fmt.Errorf("engram: redact cloud upgrade snapshots: %w", err)
 	}
 	return nil
 }
@@ -1077,9 +1093,6 @@ func (s *Store) migrate() error {
 			);
 		`
 	if _, err := s.execHook(s.db, schema); err != nil {
-		return err
-	}
-	if err := s.redactCloudUpgradeSnapshots(); err != nil {
 		return err
 	}
 

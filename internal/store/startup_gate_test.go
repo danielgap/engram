@@ -11,12 +11,19 @@ package store
 //     stamped by a newer engram.
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -91,6 +98,47 @@ func TestUserVersionGateSkipsSecondOpen(t *testing.T) {
 	}
 }
 
+func TestSchemaVersionTracksMigrationBody(t *testing.T) {
+	fingerprints := map[int]string{
+		1: "5fb0278991365e19d46168d747bf1c50482a1b22829e2d59a0341f36fc67e4b3",
+	}
+	want, ok := fingerprints[schemaVersion]
+	if !ok {
+		t.Fatalf("schemaVersion %d has no migration fingerprint; add a new entry instead of replacing an older version", schemaVersion)
+	}
+	got := migrationBodyFingerprint(t)
+	if got != want {
+		t.Fatalf("migrate body fingerprint = %q, want %q for schemaVersion %d; bump schemaVersion and add the new fingerprint", got, want, schemaVersion)
+	}
+}
+
+func migrationBodyFingerprint(t *testing.T) string {
+	t.Helper()
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate startup_gate_test.go")
+	}
+	storePath := filepath.Join(filepath.Dir(testFile), "store.go")
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, storePath, nil, 0)
+	if err != nil {
+		t.Fatalf("parse store.go: %v", err)
+	}
+	for _, decl := range parsed.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || fn.Name.Name != "migrate" {
+			continue
+		}
+		var body bytes.Buffer
+		if err := format.Node(&body, fset, fn.Body); err != nil {
+			t.Fatalf("format migrate body: %v", err)
+		}
+		return fmt.Sprintf("%x", sha256.Sum256(body.Bytes()))
+	}
+	t.Fatal("Store.migrate not found in store.go")
+	return ""
+}
+
 func TestNewerSchemaVersionIsLeftUntouched(t *testing.T) {
 	cfg := mustDefaultConfig(t)
 	cfg.DataDir = t.TempDir()
@@ -111,6 +159,10 @@ func TestNewerSchemaVersionIsLeftUntouched(t *testing.T) {
 	}
 	if _, err := raw.Exec(fmt.Sprintf("PRAGMA user_version = %d", future)); err != nil {
 		t.Fatalf("stamp future user_version: %v", err)
+	}
+	const futureSnapshot = `{"cloud_config_present":true,"project_enrolled":true}`
+	if _, err := raw.Exec(`INSERT INTO cloud_upgrade_state (project, stage, snapshot_json) VALUES (?, ?, ?)`, "future-schema", UpgradeStageDoctorReady, futureSnapshot); err != nil {
+		t.Fatalf("seed future-schema snapshot: %v", err)
 	}
 	if err := raw.Close(); err != nil {
 		t.Fatalf("raw close: %v", err)
@@ -134,6 +186,13 @@ func TestNewerSchemaVersionIsLeftUntouched(t *testing.T) {
 	}
 	if v != future {
 		t.Fatalf("user_version was rewritten to %d, want it left at %d", v, future)
+	}
+	var snapshot string
+	if err := s2.db.QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, "future-schema").Scan(&snapshot); err != nil {
+		t.Fatalf("read future-schema snapshot: %v", err)
+	}
+	if snapshot != futureSnapshot {
+		t.Fatalf("future-schema snapshot was rewritten to %q, want untouched %q", snapshot, futureSnapshot)
 	}
 }
 
@@ -213,7 +272,11 @@ func TestConcurrentColdStartGoroutines(t *testing.T) {
 
 // coldStartChildEnv points a re-executed child copy of the test binary at the
 // shared data directory used by TestConcurrentColdStartProcesses.
-const coldStartChildEnv = "ENGRAM_TEST_COLDSTART_DIR"
+const (
+	coldStartChildEnv      = "ENGRAM_TEST_COLDSTART_DIR"
+	coldStartChildIndexEnv = "ENGRAM_TEST_COLDSTART_INDEX"
+	coldStartReleaseFile   = ".coldstart-release"
+)
 
 // TestColdStartChildProcess is not a standalone test: it is re-executed as a
 // child process by TestConcurrentColdStartProcesses and skips otherwise.
@@ -229,6 +292,18 @@ func TestColdStartChildProcess(t *testing.T) {
 	}
 	cfg.DataDir = dir
 	cfg.DedupeWindow = time.Hour
+
+	index := os.Getenv(coldStartChildIndexEnv)
+	if index == "" {
+		t.Fatal("cold-start child index is required")
+	}
+	readyPath := filepath.Join(dir, ".coldstart-ready-"+index)
+	if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
+		t.Fatalf("signal child readiness: %v", err)
+	}
+	if err := waitForColdStartFile(filepath.Join(dir, coldStartReleaseFile), 30*time.Second); err != nil {
+		t.Fatalf("wait for parent release: %v", err)
+	}
 
 	s, err := New(cfg)
 	if err != nil {
@@ -256,16 +331,32 @@ func TestConcurrentColdStartProcesses(t *testing.T) {
 
 	cmds := make([]*exec.Cmd, procs)
 	outputs := make([]*strings.Builder, procs)
+	defer func() {
+		for _, cmd := range cmds {
+			if cmd != nil && cmd.Process != nil && cmd.ProcessState == nil {
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}
+		}
+	}()
 	for i := range cmds {
 		outputs[i] = &strings.Builder{}
 		cmd := exec.Command(exe, "-test.run", "^TestColdStartChildProcess$", "-test.v", "-test.timeout", "60s")
-		cmd.Env = append(os.Environ(), coldStartChildEnv+"="+dir)
+		cmd.Env = append(os.Environ(), coldStartChildEnv+"="+dir, fmt.Sprintf("%s=%d", coldStartChildIndexEnv, i))
 		cmd.Stdout = outputs[i]
 		cmd.Stderr = outputs[i]
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start child %d: %v", i, err)
 		}
 		cmds[i] = cmd
+	}
+	for i := range cmds {
+		if err := waitForColdStartFile(filepath.Join(dir, fmt.Sprintf(".coldstart-ready-%d", i)), 30*time.Second); err != nil {
+			t.Fatalf("wait for child %d readiness: %v", i, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, coldStartReleaseFile), []byte("release"), 0o600); err != nil {
+		t.Fatalf("release cold-start children: %v", err)
 	}
 	for i, cmd := range cmds {
 		if err := cmd.Wait(); err != nil {
@@ -311,6 +402,21 @@ func TestConcurrentColdStartProcesses(t *testing.T) {
 	}
 	if integrity != "ok" {
 		t.Errorf("integrity_check = %q, want ok", integrity)
+	}
+}
+
+func waitForColdStartFile(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("timed out after %s waiting for %s", timeout, path)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
