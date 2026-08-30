@@ -925,7 +925,7 @@ Actions:
 
 ### mem_pin
 
-Pin a local observation so it appears before recent observations in memory context. Pinned state is **local to this device and is not synced**. Available in the `agent` profile (`engram mcp --tools=agent`), deferred.
+Pin a local observation so it appears before recent observations in memory context. Pinned state is **local to this device and is not synced**. Available in the `agent` profile (`engram mcp --tools=agent`).
 
 Parameters:
 
@@ -935,7 +935,7 @@ Returns `{ "result": "Memory #N pinned", "id": N, "sync_id": ..., "pinned": true
 
 ### mem_unpin
 
-Unpin a local observation so it only appears in normal recency order in memory context. Pinned state is **local to this device and is not synced**. Available in the `agent` profile (`engram mcp --tools=agent`), deferred.
+Unpin a local observation so it only appears in normal recency order in memory context. Pinned state is **local to this device and is not synced**. Available in the `agent` profile (`engram mcp --tools=agent`).
 
 Parameters:
 
