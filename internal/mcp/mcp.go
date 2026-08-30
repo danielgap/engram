@@ -858,7 +858,7 @@ Duplicates are automatically detected and skipped — safe to call multiple time
 	if shouldRegister("mem_list_projects", allowlist) {
 		srv.AddTool(
 			mcp.NewTool("mem_list_projects",
-				mcp.WithDescription("List every project known to Engram, with per-project observation/session/prompt counts, ordered by observation count (same view as `engram projects list`). Use for cross-project discovery when the working directory matches no known project: pick the right project, then scope mem_search/mem_context to it. Returns a successful empty list when nothing is stored yet — never errors."),
+				mcp.WithDescription("List every project known to Engram, with per-project observation/session/prompt counts, ordered by observation count (same view as `engram projects list`). Use for cross-project discovery when the working directory matches no known project: pick the right project, then scope mem_search/mem_context to it. Returns a successful empty list when nothing is stored yet; a store failure returns a tool error."),
 				mcp.WithTitleAnnotation("List Known Projects"),
 				mcp.WithReadOnlyHintAnnotation(true),
 				mcp.WithDestructiveHintAnnotation(false),
@@ -1001,12 +1001,10 @@ ERROR: Returns IsError=true if IDs are unknown, relation is invalid, or cross-pr
 
 // ─── Tool Handlers ───────────────────────────────────────────────────────────
 
-// handleCurrentProject implements mem_current_project. It NEVER returns an error
-// even on ambiguous cwd — it always returns a success result with whatever
-// detection info is available (REQ-313).
 // handleListProjects serves mem_list_projects (engram#675): the MCP view of
 // `engram projects list`, backed by the same store query (ListProjectsWithStats)
-// so CLI and MCP never diverge.
+// so CLI and MCP never diverge. An empty store is a successful empty listing;
+// a store-query failure is surfaced as a tool error.
 func handleListProjects(s *store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projects, err := s.ListProjectsWithStats()
@@ -1024,6 +1022,9 @@ func handleListProjects(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
+// handleCurrentProject implements mem_current_project. It NEVER returns an error
+// even on ambiguous cwd — it always returns a success result with whatever
+// detection info is available (REQ-313).
 func handleCurrentProject(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		cwd, _ := os.Getwd()

@@ -923,6 +923,26 @@ Actions:
 
 `mark_reviewed` is local-only for now: `review_after` is intentionally not part of sync payloads in this phase, so resetting the review cycle does not enqueue a sync mutation or propagate to other machines.
 
+### mem_pin
+
+Pin a local observation so it appears before recent observations in memory context. Pinned state is **local to this device and is not synced**. Available in the `agent` profile (`engram mcp --tools=agent`), deferred.
+
+Parameters:
+
+- **id** (required): int — observation ID to pin
+
+Returns `{ "result": "Memory #N pinned", "id": N, "sync_id": ..., "pinned": true }`. Idempotent: pinning an already-pinned observation succeeds without change. Errors: missing/zero `id` ("id is required"), or a store failure ("Failed to update pin state: ...").
+
+### mem_unpin
+
+Unpin a local observation so it only appears in normal recency order in memory context. Pinned state is **local to this device and is not synced**. Available in the `agent` profile (`engram mcp --tools=agent`), deferred.
+
+Parameters:
+
+- **id** (required): int — observation ID to unpin
+
+Returns `{ "result": "Memory #N unpinned", "id": N, "sync_id": ..., "pinned": false }`. Idempotent: unpinning an already-unpinned observation succeeds without change. Errors: missing/zero `id` ("id is required"), or a store failure ("Failed to update pin state: ...").
+
 ### mem_suggest_topic_key
 
 Suggest a stable `topic_key` from `type + title` (or content fallback). Uses family heuristics like `architecture/*`, `bug/*`, `decision/*`, etc. Use before `mem_save` when you want evolving topics to upsert into a single observation.
@@ -1000,7 +1020,14 @@ Detect the current project from the working directory. Returns `project`, `proje
     
 ### mem_list_projects
     
-List every project known to Engram with per-project `observation_count`, `session_count`, `prompt_count`, and known `directories`, ordered by observation count descending — the same view as `engram projects list`. Returns `{ "projects": [...], "count": N }` and never errors; an empty store returns a successful empty list. Use it for cross-project discovery when the working directory matches no known project, then scope `mem_search`/`mem_context` to the chosen project.
+List every project known to Engram with per-project `observation_count`, `session_count`, `prompt_count`, and known `directories`, ordered by observation count descending — the same view as `engram projects list`. Returns `{ "projects": [...], "count": N }`.
+
+Result semantics:
+
+- **Empty store** — successful response with `{ "projects": [], "count": 0 }`. Discovery never fails just because nothing is stored yet.
+- **Store-query failure** — returns a tool error (`List projects failed: ...`) instead of a success envelope, so the agent knows discovery failed rather than trusting an empty answer.
+
+Use it for cross-project discovery when the working directory matches no known project, then scope `mem_search`/`mem_context` to the chosen project.
     
 ### mem_doctor
 
