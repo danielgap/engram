@@ -9505,10 +9505,11 @@ func TestMemListProjects_Registered(t *testing.T) {
 
 // TestMemListProjects_ReturnsProjectsWithStats: the MCP view must list every
 // known project from the same store query as `engram projects list`, with the
-// per-project counts, ordered by observation count descending (engram#675).
+// full per-project contract — observation, session, and prompt counts plus
+// known directories — ordered by observation count descending (engram#675).
 func TestMemListProjects_ReturnsProjectsWithStats(t *testing.T) {
 	s := newMCPTestStore(t)
-	seed := func(sessID, project, dir string, obs int) {
+	seed := func(sessID, project, dir string, obs, prompts int) {
 		t.Helper()
 		if _, err := s.DB().Exec(
 			`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`,
@@ -9525,9 +9526,21 @@ func TestMemListProjects_ReturnsProjectsWithStats(t *testing.T) {
 				t.Fatalf("insert observation: %v", err)
 			}
 		}
+		for i := 0; i < prompts; i++ {
+			if _, err := s.DB().Exec(`
+				INSERT INTO user_prompts (session_id, content, project)
+				VALUES (?, ?, ?)`,
+				sessID, "p", project,
+			); err != nil {
+				t.Fatalf("insert prompt: %v", err)
+			}
+		}
 	}
-	seed("sess-alpha", "alpha-project", "/tmp/alpha", 3)
-	seed("sess-beta", "beta-project", "/tmp/beta", 1)
+	seed("sess-alpha", "alpha-project", "/tmp/alpha", 3, 2)
+	seed("sess-beta", "beta-project", "/tmp/beta", 1, 1)
+	// A second beta session in another directory and with no observations must
+	// still surface in session_count and directories for beta-project.
+	seed("sess-beta-alt", "beta-project", "/tmp/beta-alt", 0, 0)
 
 	h := handleListProjects(s)
 	res, err := h(context.Background(), mcppkg.CallToolRequest{})
@@ -9541,9 +9554,11 @@ func TestMemListProjects_ReturnsProjectsWithStats(t *testing.T) {
 	var envelope struct {
 		Count    int `json:"count"`
 		Projects []struct {
-			Name             string `json:"name"`
-			ObservationCount int    `json:"observation_count"`
-			SessionCount     int    `json:"session_count"`
+			Name             string   `json:"name"`
+			ObservationCount int      `json:"observation_count"`
+			SessionCount     int      `json:"session_count"`
+			PromptCount      int      `json:"prompt_count"`
+			Directories      []string `json:"directories"`
 		} `json:"projects"`
 	}
 	if err := json.Unmarshal([]byte(callResultText(t, res)), &envelope); err != nil {
@@ -9553,17 +9568,62 @@ func TestMemListProjects_ReturnsProjectsWithStats(t *testing.T) {
 		t.Fatalf("expected 2 projects, got count=%d len=%d: %s",
 			envelope.Count, len(envelope.Projects), callResultText(t, res))
 	}
-	byName := map[string]int{}
-	for _, p := range envelope.Projects {
-		byName[p.Name] = p.ObservationCount
+	type expected struct {
+		observations, sessions, prompts int
+		directories                     []string
 	}
-	if byName["alpha-project"] != 3 || byName["beta-project"] != 1 {
-		t.Fatalf("expected alpha=3 beta=1 observations, got %v", byName)
+	want := map[string]expected{
+		"alpha-project": {3, 1, 2, []string{"/tmp/alpha"}},
+		"beta-project":  {1, 2, 1, []string{"/tmp/beta", "/tmp/beta-alt"}},
+	}
+	for _, p := range envelope.Projects {
+		w, ok := want[p.Name]
+		if !ok {
+			t.Fatalf("unexpected project %q in listing", p.Name)
+		}
+		if p.ObservationCount != w.observations || p.SessionCount != w.sessions || p.PromptCount != w.prompts {
+			t.Fatalf("%s: expected obs=%d sessions=%d prompts=%d, got obs=%d sessions=%d prompts=%d",
+				p.Name, w.observations, w.sessions, w.prompts,
+				p.ObservationCount, p.SessionCount, p.PromptCount)
+		}
+		if len(p.Directories) != len(w.directories) {
+			t.Fatalf("%s: expected directories %v, got %v", p.Name, w.directories, p.Directories)
+		}
+		gotDirs := map[string]bool{}
+		for _, d := range p.Directories {
+			gotDirs[d] = true
+		}
+		for _, d := range w.directories {
+			if !gotDirs[d] {
+				t.Fatalf("%s: expected directory %q, got %v", p.Name, d, p.Directories)
+			}
+		}
 	}
 	// Same ordering contract as `engram projects list`: observations desc.
 	if envelope.Projects[0].Name != "alpha-project" {
 		t.Fatalf("expected observation-count-descending order, got %q first",
 			envelope.Projects[0].Name)
+	}
+}
+
+// TestMemListProjects_StoreErrorIsToolError: a store-query failure must
+// surface as a tool error, not as a success envelope with stale data — the
+// agent has to know discovery failed instead of trusting an empty answer.
+func TestMemListProjects_StoreErrorIsToolError(t *testing.T) {
+	s := newMCPTestStore(t)
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	h := handleListProjects(s)
+	res, err := h(context.Background(), mcppkg.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("store failure must return a tool error, got: %s", callResultText(t, res))
+	}
+	if msg := callResultText(t, res); !strings.Contains(msg, "List projects failed") {
+		t.Fatalf("error must identify the failing query, got: %s", msg)
 	}
 }
 
