@@ -1015,11 +1015,11 @@ Extract structured learnings from text output. Looks for `## Key Learnings:` sec
 **Admin tool.** Merge multiple project name variants into a single canonical name. Requires `from` as a comma-separated list of source project names and `to` as the target canonical name. All observations, sessions, and prompts from the source projects are reassigned to the canonical project.
 
 ### mem_current_project
-    
+
 Detect the current project from the working directory. Returns `project`, `project_source`, `project_path`, `cwd`, `available_projects`, and `warning`. Never returns an error — even on ambiguous cwd it returns success with an empty `project` and non-empty `available_projects`. Recommended as the first call when starting a session.
-    
+
 ### mem_list_projects
-    
+
 List every project known to Engram with per-project `observation_count`, `session_count`, `prompt_count`, and known `directories`, ordered by observation count descending — the same view as `engram projects list`. Returns `{ "projects": [...], "count": N }`.
 
 Included in the `agent` profile; `engram mcp` registers all tools by default, so `--tools=agent` is not required to use it.
@@ -1030,7 +1030,7 @@ Result semantics:
 - **Store-query failure** — returns a tool error (`List projects failed: ...`) instead of a success envelope, so the agent knows discovery failed rather than trusting an empty answer.
 
 Use it for cross-project discovery when the working directory matches no known project, then scope `mem_search`/`mem_context` to the chosen project.
-    
+
 ### mem_doctor
 
 Run read-only operational diagnostics. Returns the same JSON report shape as `engram doctor --json`, with optional `project` and `check` filters. The optional `project` override is validated with read-project resolution before diagnostics run.
@@ -1097,6 +1097,7 @@ Format for `mem_save`:
 - **scope**: `project` (default) | `personal` | `global`
 - **topic_key** (optional, recommended for evolving decisions): stable key like `architecture/auth-model`
 - **content**:
+
   ```
   **What**: One sentence — what was done
   **Why**: What motivated it (user request, bug, performance, etc.)
