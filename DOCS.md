@@ -1022,6 +1022,8 @@ Detect the current project from the working directory. Returns `project`, `proje
     
 List every project known to Engram with per-project `observation_count`, `session_count`, `prompt_count`, and known `directories`, ordered by observation count descending — the same view as `engram projects list`. Returns `{ "projects": [...], "count": N }`.
 
+Included in the `agent` profile; `engram mcp` registers all tools by default, so `--tools=agent` is not required to use it.
+
 Result semantics:
 
 - **Empty store** — successful response with `{ "projects": [], "count": 0 }`. Discovery never fails just because nothing is stored yet.
