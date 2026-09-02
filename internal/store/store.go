@@ -852,7 +852,8 @@ func (s *Store) migrate() error {
 			project,
 			topic_key,
 			content='observations',
-			content_rowid='id'
+			content_rowid='id',
+			tokenize='porter unicode61'
 		);
 
 			CREATE TABLE IF NOT EXISTS user_prompts (
@@ -880,7 +881,8 @@ func (s *Store) migrate() error {
 			content,
 			project,
 			content='user_prompts',
-			content_rowid='id'
+			content_rowid='id',
+			tokenize='porter unicode61'
 		);
 
 			CREATE TABLE IF NOT EXISTS sync_chunks (
@@ -980,6 +982,11 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_prompt_tombstones_project ON prompt_tombstones(project, deleted_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_target_seq ON sync_mutations(target_key, seq);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_pending ON sync_mutations(target_key, acked_at, seq);
+		-- Expression indexes make LOWER(project) filters sargable without a data
+		-- backfill: scan paths (stats, recents, compaction, search joins) avoid a
+		-- full-table scan plus per-row LOWER() call on legacy mixed-case rows.
+		CREATE INDEX IF NOT EXISTS idx_obs_project_lower ON observations(LOWER(project));
+		CREATE INDEX IF NOT EXISTS idx_prompts_project_lower ON user_prompts(LOWER(project));
 	`); err != nil {
 		return err
 	}
@@ -1174,6 +1181,10 @@ func (s *Store) migrate() error {
 	}
 
 	if err := s.migrateFTSTopicKey(); err != nil {
+		return err
+	}
+
+	if err := s.migrateFTSPorter(); err != nil {
 		return err
 	}
 	if err := s.withTx(func(tx *sql.Tx) error {
@@ -2258,15 +2269,119 @@ func (s *Store) migrateFTSTopicKey() error {
 			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
 		END;
 
-		CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
-			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
-			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
-			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
-			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
-		END;
-	`); err != nil {
+    		CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
+    			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
+    			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+    			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+    			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
+    		END;
+    	`); err != nil {
 		return fmt.Errorf("migrate fts topic_key: %w", err)
 	}
+	return nil
+}
+
+// ftsTableNeedsPorter reports whether an FTS5 table exists but was created
+// without the porter tokenizer (legacy databases). A missing table returns
+// false: the initial schema creates it with porter directly.
+func (s *Store) ftsTableNeedsPorter(table string) bool {
+	var ddl string
+	err := s.db.QueryRow(
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name = ?", table,
+	).Scan(&ddl)
+	if err != nil {
+		return false
+	}
+	return !strings.Contains(strings.ToLower(ddl), "porter")
+}
+
+// migrateFTSPorter rebuilds the FTS index tables with the porter tokenizer
+// (wrapping unicode61) so morphological variants match: querying
+// "configuring" finds content containing "configured". Idempotent via DDL
+// inspection; mirrors the proven migrateFTSTopicKey rebuild pattern for
+// external-content tables (drop triggers, recreate table, repopulate,
+// recreate triggers).
+func (s *Store) migrateFTSPorter() error {
+	if s.ftsTableNeedsPorter("observations_fts") {
+		if _, err := s.execHook(s.db, `
+			DROP TRIGGER IF EXISTS obs_fts_insert;
+			DROP TRIGGER IF EXISTS obs_fts_update;
+			DROP TRIGGER IF EXISTS obs_fts_delete;
+			DROP TABLE IF EXISTS observations_fts;
+			CREATE VIRTUAL TABLE observations_fts USING fts5(
+				title,
+				content,
+				tool_name,
+				type,
+				project,
+				topic_key,
+				content='observations',
+				content_rowid='id',
+				tokenize='porter unicode61'
+			);
+			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+			SELECT id, title, content, tool_name, type, project, topic_key
+			FROM observations
+			WHERE deleted_at IS NULL;
+
+			CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations BEGIN
+				INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+				VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
+			END;
+
+			CREATE TRIGGER obs_fts_delete AFTER DELETE ON observations BEGIN
+				INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
+				VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+			END;
+
+			CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
+				INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
+				VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+				INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+				VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
+			END;
+		`); err != nil {
+			return fmt.Errorf("migrate fts porter observations: %w", err)
+		}
+	}
+
+	if s.ftsTableNeedsPorter("prompts_fts") {
+		if _, err := s.execHook(s.db, `
+			DROP TRIGGER IF EXISTS prompt_fts_insert;
+			DROP TRIGGER IF EXISTS prompt_fts_update;
+			DROP TRIGGER IF EXISTS prompt_fts_delete;
+			DROP TABLE IF EXISTS prompts_fts;
+			CREATE VIRTUAL TABLE prompts_fts USING fts5(
+				content,
+				project,
+				content='user_prompts',
+				content_rowid='id',
+				tokenize='porter unicode61'
+			);
+			INSERT INTO prompts_fts(rowid, content, project)
+			SELECT id, content, project FROM user_prompts;
+
+			CREATE TRIGGER prompt_fts_insert AFTER INSERT ON user_prompts BEGIN
+				INSERT INTO prompts_fts(rowid, content, project)
+				VALUES (new.id, new.content, new.project);
+			END;
+
+			CREATE TRIGGER prompt_fts_delete AFTER DELETE ON user_prompts BEGIN
+				INSERT INTO prompts_fts(prompts_fts, rowid, content, project)
+				VALUES ('delete', old.id, old.content, old.project);
+			END;
+
+			CREATE TRIGGER prompt_fts_update AFTER UPDATE ON user_prompts BEGIN
+				INSERT INTO prompts_fts(prompts_fts, rowid, content, project)
+				VALUES ('delete', old.id, old.content, old.project);
+				INSERT INTO prompts_fts(rowid, content, project)
+				VALUES (new.id, new.content, new.project);
+			END;
+		`); err != nil {
+			return fmt.Errorf("migrate fts porter prompts: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -3695,7 +3810,11 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 		ftsQuery = sanitizeFTS(query)
 	}
 
-	sqlQ, args := buildSearchFTSQuery(ftsQuery, opts, limit)
+	// Over-fetch beyond the requested limit so the composite rerank below can
+	// promote fresh/pinned/reinforced rows that pure BM25 would bury. limit is
+	// already capped at MaxSearchResults (default 20), so this stays bounded.
+	overfetch := limit * 3
+	sqlQ, args := buildSearchFTSQuery(ftsQuery, opts, overfetch)
 	rows, err := s.queryItContextHook(ctx, sqlQ, args...)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -3710,8 +3829,7 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 		seen[dr.ID] = true
 	}
 
-	var results []SearchResult
-	results = append(results, directResults...)
+	var ftsRows []SearchResult
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -3732,7 +3850,7 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 			return nil, err
 		}
 		if !seen[sr.ID] {
-			results = append(results, sr)
+			ftsRows = append(ftsRows, sr)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -3745,6 +3863,14 @@ func (s *Store) SearchContext(ctx context.Context, query string, opts SearchOpti
 		return nil, err
 	}
 
+	// Composite rerank: BM25 relevance × recency decay × pinned × revision
+	// reinforcement. Direct topic_key hits keep their precedence ahead of the
+	// reranked FTS rows.
+	ftsRows = rerankSearchResults(ftsRows, time.Now().UTC())
+
+	var results []SearchResult
+	results = append(results, directResults...)
+	results = append(results, ftsRows...)
 	if len(results) > limit {
 		results = results[:limit]
 	}

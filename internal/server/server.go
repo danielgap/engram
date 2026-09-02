@@ -790,6 +790,9 @@ func (s *Server) handleSearchPrompts(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if prompts == nil {
+		prompts = []store.Prompt{}
+	}
 
 	jsonResponse(w, http.StatusOK, prompts)
 }

@@ -78,6 +78,24 @@ func newServerTestStore(t *testing.T) *store.Store {
 	return s
 }
 
+// TestPromptsSearchEmptyReturnsArray guards the JSON list contract: a zero-hit
+// /prompts/search must respond with [] (not null). Clients that treat a null
+// body as a transport failure report "could not reach" for perfectly healthy
+// empty searches (#672); /search got the same guard in #862.
+func TestPromptsSearchEmptyReturnsArray(t *testing.T) {
+	srv := New(newServerTestStore(t), 0)
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/prompts/search?q=zzzznomatch", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /prompts/search status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != "[]" {
+		t.Fatalf("zero-hit prompts search must return [], got %q", body)
+	}
+}
+
 func TestStartUsesDefaultListenWhenListenNil(t *testing.T) {
 	s := New(newServerTestStore(t), 0)
 	s.listen = nil
