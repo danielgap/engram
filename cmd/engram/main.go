@@ -798,6 +798,10 @@ func cmdServe(cfg store.Config) {
 
 	srv := newHTTPServer(s, port)
 
+	// Report the ldflags-injected release version from GET /health so a stale
+	// daemon serving an old API surface becomes visible without a restart.
+	srv.SetVersion(version)
+
 	// Wire the semantic runner factory and prompt builder for POST /conflicts/scan.
 	// Both live in cmd/engram so internal/server avoids a direct dependency on internal/llm.
 	srv.SetRunnerFactory(agentRunnerFactory)

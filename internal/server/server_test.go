@@ -3386,3 +3386,36 @@ func TestHandleUpdateObservationRejectsBlankTitleWithoutSideEffects(t *testing.T
 		t.Fatalf("expected 404 for missing observation, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// GET /health reports the wired release version so monitoring can detect a
+// stale daemon (the 63-day 0.1.0 incident, ops/engram/ops/stale-serve-after-brew-upgrade).
+func TestHealthReportsWiredVersion(t *testing.T) {
+	st := newServerTestStore(t)
+
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected /health 200, got %d", rec.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode /health: %v", err)
+	}
+	if v, _ := resp["version"].(string); v != "dev" {
+		t.Fatalf("unwired server /health version = %q, want \"dev\"", v)
+	}
+
+	srv.SetVersion("1.16.0")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	var resp2 map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("decode /health after SetVersion: %v", err)
+	}
+	if v, _ := resp2["version"].(string); v != "1.16.0" {
+		t.Fatalf("wired server /health version = %q, want \"1.16.0\"", v)
+	}
+}
