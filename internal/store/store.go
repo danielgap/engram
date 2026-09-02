@@ -3346,22 +3346,7 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 	if hasShortFTSTerm(query) {
 		sql, args = buildPromptLIKEQuery(query, project, limit)
 	} else {
-		ftsQuery := sanitizeFTS(query)
-		sql = `
-			SELECT p.id, ifnull(p.sync_id, '') as sync_id, p.session_id, p.content, ifnull(p.project, '') as project, p.created_at
-			FROM prompts_fts fts
-			JOIN user_prompts p ON p.id = fts.rowid
-			WHERE prompts_fts MATCH ?
-		`
-		args = []any{ftsQuery}
-
-		if project != "" {
-			sql += " AND p.project = ?"
-			args = append(args, project)
-		}
-
-		sql += " ORDER BY fts.rank LIMIT ?"
-		args = append(args, limit)
+		sql, args = buildSearchPromptsFTSQuery(sanitizeFTS(query), project, limit)
 	}
 
 	rows, err := s.queryItHook(s.db, sql, args...)
@@ -3379,6 +3364,29 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 		results = append(results, p)
 	}
 	return results, rows.Err()
+}
+
+// buildSearchPromptsFTSQuery assembles the prompts FTS query. CROSS JOIN is
+// load-bearing: it pins prompts_fts as the outer table so the MATCH runs once.
+// A plain JOIN lets the planner reorder on small tables and drive the query
+// from user_prompts, re-evaluating the MATCH once per row (benchmarked 3x
+// slower than the observations search over a 10x larger index).
+func buildSearchPromptsFTSQuery(ftsQuery string, project string, limit int) (string, []any) {
+	sqlQ := `
+		SELECT p.id, ifnull(p.sync_id, '') as sync_id, p.session_id, p.content, ifnull(p.project, '') as project, p.created_at
+		FROM prompts_fts fts
+		CROSS JOIN user_prompts p ON p.id = fts.rowid
+		WHERE prompts_fts MATCH ?
+	`
+	args := []any{ftsQuery}
+
+	if project != "" {
+		sqlQ += " AND p.project = ?"
+		args = append(args, project)
+	}
+
+	sqlQ += " ORDER BY fts.rank LIMIT ?"
+	return sqlQ, append(args, limit)
 }
 
 // ─── Delete Session ──────────────────────────────────────────────────────────
