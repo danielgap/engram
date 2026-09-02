@@ -11415,10 +11415,12 @@ func TestAddObservation_DecayDefaults(t *testing.T) {
 		{"decision", false, 6},
 		{"policy", false, 12},
 		{"preference", false, 3},
+		{"bugfix", false, 9},
+		{"discovery", false, 6},
+		{"pattern", false, 12},
+		{"architecture", false, 24},
 		{"observation", true, 0},
 		{"manual", true, 0},
-		{"bugfix", true, 0},
-		{"architecture", true, 0},
 		{"", true, 0},
 	}
 

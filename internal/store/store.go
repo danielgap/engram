@@ -270,14 +270,27 @@ const (
 	decayDecisionMonths   = 6
 	decayPolicyMonths     = 12
 	decayPreferenceMonths = 3
+	// Phase 2: code-adjacent learnings enter the review lifecycle too. Horizons
+	// scale with how fast the underlying subject rots: discoveries describe
+	// codebase facts that drift as code changes; patterns are conventions that
+	// persist but evolve; architecture is the most durable structural record.
+	decayBugfixMonths       = 9
+	decayDiscoveryMonths    = 6
+	decayPatternMonths      = 12
+	decayArchitectureMonths = 24
 )
 
 // decayReviewAfterMonths maps observation type → month offset for review_after.
-// Types absent from this map get review_after = NULL (Phase 1 behavior).
+// Types absent from this map get review_after = NULL (manual curation stays
+// out of the automatic lifecycle).
 var decayReviewAfterMonths = map[string]int{
-	"decision":   decayDecisionMonths,
-	"policy":     decayPolicyMonths,
-	"preference": decayPreferenceMonths,
+	"decision":     decayDecisionMonths,
+	"policy":       decayPolicyMonths,
+	"preference":   decayPreferenceMonths,
+	"bugfix":       decayBugfixMonths,
+	"discovery":    decayDiscoveryMonths,
+	"pattern":      decayPatternMonths,
+	"architecture": decayArchitectureMonths,
 }
 
 const observationSelectColumns = `id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
