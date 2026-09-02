@@ -3419,3 +3419,45 @@ func TestHealthReportsWiredVersion(t *testing.T) {
 		t.Fatalf("wired server /health version = %q, want \"1.16.0\"", v)
 	}
 }
+
+// Regression for #945: /stats?all_projects=true must skip current-project
+// resolution entirely, even when cwd is a multi-repo workspace where
+// current-project detection is ambiguous. Global aggregate stats need no
+// project, so the endpoint must not inherit the ambiguous_project conflict.
+func TestStatsAllProjectsSkipsAmbiguousCwdResolution(t *testing.T) {
+	st := newServerTestStore(t)
+	for _, name := range []string{"repo-a", "repo-b"} {
+		if err := st.CreateSession("s-"+name, name, "/tmp/"+name); err != nil {
+			t.Fatalf("create %s session: %v", name, err)
+		}
+	}
+
+	s := New(st, 0)
+	parent := ambiguousProjectHTTPDirectory(t)
+
+	// Sanity: without all_projects the ambiguous cwd still conflicts —
+	// current-project stats genuinely require a project.
+	scoped := httptest.NewRequest(http.MethodGet, "/stats?cwd="+url.QueryEscape(parent), nil)
+	scopedRec := httptest.NewRecorder()
+	s.handleStats(scopedRec, scoped)
+	if scopedRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for scoped stats in multi-repo cwd, got %d body=%s", scopedRec.Code, scopedRec.Body.String())
+	}
+
+	// The bug: all_projects must not consult current-project detection.
+	req := httptest.NewRequest(http.MethodGet, "/stats?all_projects=true&cwd="+url.QueryEscape(parent), nil)
+	rec := httptest.NewRecorder()
+	s.handleStats(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for all_projects stats in multi-repo cwd, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var stats store.Stats
+	if err := json.Unmarshal(rec.Body.Bytes(), &stats); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	// The aggregate spans every project: sessions from repo-a and repo-b both count.
+	// (Projects lists only projects with observations, so it is not asserted here.)
+	if stats.TotalSessions != 2 {
+		t.Fatalf("all_projects aggregate sessions = %d, want 2", stats.TotalSessions)
+	}
+}
