@@ -206,3 +206,38 @@ func TestSearchExactTokensStillMatch(t *testing.T) {
 		t.Fatalf("exact-token search broken: got %v", results)
 	}
 }
+
+// TestSearchPromptsQueryPlanUsesFTSFirst guards the join order of the prompts
+// search: prompts_fts must drive the query (VIRTUAL TABLE INDEX scan) with
+// user_prompts looked up by rowid. A plain JOIN lets the planner reorder on
+// small tables and re-evaluate the MATCH once per row, which benchmarked 3x
+// slower than the observations search over a 10x larger index.
+func TestSearchPromptsQueryPlanUsesFTSFirst(t *testing.T) {
+	s := newTestStore(t)
+	seedSearchCorpusTB(t, s, 50)
+
+	sqlQ, args := buildSearchPromptsFTSQuery(`"auth"`, "engram", 10)
+	rows, err := s.db.Query("EXPLAIN QUERY PLAN "+sqlQ, args...)
+	if err != nil {
+		t.Fatalf("explain query plan: %v", err)
+	}
+	defer rows.Close()
+
+	var plan []string
+	for rows.Next() {
+		var cols [4]any
+		if err := rows.Scan(&cols[0], &cols[1], &cols[2], &cols[3]); err != nil {
+			t.Fatalf("scan explain row: %v", err)
+		}
+		plan = append(plan, fmt.Sprint(cols[3]))
+	}
+	joined := strings.Join(plan, " | ")
+	t.Logf("plan: %s", joined)
+
+	if !strings.HasPrefix(joined, "SCAN fts VIRTUAL TABLE INDEX") {
+		t.Fatalf("prompts search must be driven by the FTS index as the outer table (MATCH runs once), got plan: %s", joined)
+	}
+	if !strings.Contains(joined, "INTEGER PRIMARY KEY (rowid=?)") {
+		t.Fatalf("user_prompts must be looked up by rowid after the MATCH, got plan: %s", joined)
+	}
+}
