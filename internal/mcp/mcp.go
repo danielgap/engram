@@ -1014,10 +1014,13 @@ func handleListProjects(s *store.Store) server.ToolHandlerFunc {
 		if projects == nil {
 			projects = []store.ProjectStats{}
 		}
-		out, _ := jsonMarshal(map[string]any{
+		out, err := jsonMarshal(map[string]any{
 			"projects": projects,
 			"count":    len(projects),
 		})
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("List projects failed to encode response: %s", err)), nil
+		}
 		return mcp.NewToolResultText(string(out)), nil
 	}
 }

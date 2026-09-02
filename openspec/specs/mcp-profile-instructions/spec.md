@@ -52,7 +52,7 @@ The instructions MUST accurately partition and advertise tools based on the conf
 #### Scenario: All/nil profile instructions
 - GIVEN an MCP server initialized with a `nil` allowlist (all tools)
 - WHEN instructions are generated
-- THEN all 22 tools MUST be advertised across CORE and DEFERRED sections.
+- THEN all 23 tools MUST be advertised across CORE and DEFERRED sections.
 
 ### Requirement: REQ-MPI-003 Plugin Hook and Skill Parity
 

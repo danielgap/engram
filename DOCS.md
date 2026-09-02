@@ -15,8 +15,6 @@ This is the complete technical reference for Engram. For getting started, see th
 | [Database Schema](#database-schema)                       | Tables, FTS5, SQLite config                                  |
 | [HTTP API](#http-api-endpoints)                           | All REST endpoints with request/response details             |
 
-| [MCP Tools](#mcp-tools-23-tools)                          | Detailed reference for all 22 memory tools                   |
-
 | [MCP Tools](#mcp-tools-23-tools)                          | Detailed reference for all 23 memory tools                   |
 
 | [MCP Project Resolution](#mcp-project-resolution)         | Auto-detection algorithm, response envelope, tool categories |
@@ -862,9 +860,6 @@ Use `mem_current_project` as the first call in a session to inspect the detectio
 Returns success even when cwd is ambiguous — empty `project` + non-empty `available_projects` signals the agent to navigate to a specific repo before writing.
 
 ---
-
-
-## MCP Tools (22 tools)
 
 ## MCP Tools (23 tools)
 
