@@ -32,8 +32,8 @@ The system MUST ensure that generated instructions across all profile configurat
 ### Requirement: REQ-MPI-002 Tool Profile Instruction Correctness
 
 The instructions MUST accurately partition and advertise tools based on the configured profile:
-1. When profile is `ProfileAgent` (`--tools=agent`), instructions MUST advertise only the 18 agent tools and MUST NOT advertise any of the 4 admin tools (`mem_stats`, `mem_delete`, `mem_timeline`, `mem_merge_projects`).
-2. When profile is `nil` or `--tools=all`, instructions MUST advertise all 22 registered tools.
+1. When profile is `ProfileAgent` (`--tools=agent`), instructions MUST advertise only the 19 agent tools and MUST NOT advertise any of the 4 admin tools (`mem_stats`, `mem_delete`, `mem_timeline`, `mem_merge_projects`).
+2. When profile is `nil` or `--tools=all`, instructions MUST advertise all 23 registered tools.
 3. When profile is `ProfileAdmin` (`--tools=admin`), instructions MUST advertise only the 4 admin tools and omit core/conflict agent blocks.
 4. When a custom allowlist is provided, instructions MUST advertise only the exact intersection of registered tools.
 
@@ -68,13 +68,13 @@ Plugin hook scripts (`session-start.sh`, `post-compaction.sh`) and memory skills
 #### Scenario: Memory skill consistency
 - GIVEN `plugin/claude-code/skills/memory/SKILL.md` or `plugin/codex/skills/memory/SKILL.md`
 - WHEN loaded by an agent
-- THEN tool lists MUST match the 18 agent tools available in `ProfileAgent`.
+- THEN tool lists MUST match the 19 agent tools available in `ProfileAgent`.
 
 ### Requirement: REQ-MPI-004 Documentation & Comment Alignment
 
-All MCP package comments, setup guides, and plugin documentation MUST consistently state that Engram exposes 18 agent tools and 22 total tools across profiles.
+All MCP package comments, setup guides, and plugin documentation MUST consistently state that Engram exposes 19 agent tools and 23 total tools across profiles.
 
 #### Scenario: Documentation verification
 - GIVEN project documentation (`docs/AGENT-SETUP.md`, `docs/PLUGINS.md`, `DOCS.md`, and `internal/mcp/mcp.go`)
 - WHEN referencing MCP tool numbers
-- THEN the documentation MUST state 18 agent tools and 22 total tools.
+- THEN the documentation MUST state 19 agent tools and 23 total tools.

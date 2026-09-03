@@ -6,8 +6,8 @@
 //
 // Tool profiles allow agents to load only the tools they need:
 //
-//	engram mcp                    → all 22 tools (default)
-//	engram mcp --tools=agent      → 18 tools agents actually use (per skill files)
+//	engram mcp                    → all 23 tools (default)
+//	engram mcp --tools=agent      → 19 tools agents actually use (per skill files)
 //	engram mcp --tools=admin      → 4 tools for TUI/CLI (delete, stats, timeline, merge)
 //	engram mcp --tools=agent,admin → combine profiles
 //	engram mcp --tools=mem_save,mem_search → individual tool names
@@ -1010,7 +1010,7 @@ func handleListProjects(s *store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projects, err := s.ListProjectsWithStats()
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("List projects failed: %s", err)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("List projects failed: %v", err)), nil
 		}
 		if projects == nil {
 			projects = []store.ProjectStats{}
@@ -1020,7 +1020,7 @@ func handleListProjects(s *store.Store) server.ToolHandlerFunc {
 			"count":    len(projects),
 		})
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("List projects failed to encode response: %s", err)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("List projects failed to encode response: %v", err)), nil
 		}
 		return mcp.NewToolResultText(string(out)), nil
 	}
