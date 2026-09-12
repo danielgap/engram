@@ -4877,7 +4877,8 @@ func TestCmdSyncCloudNoOpImportRendersInitialAndFinalProgress(t *testing.T) {
 
 // TestCmdSyncCloudImportPrintsSkippedRelationWarnings verifies that relation
 // upserts skipped for permanently missing endpoints surface as visible CLI
-// warnings (issue #1135) instead of dying silently in the deferred queue.
+// warnings (issue #1135) instead of dying silently in the deferred queue, on
+// both the imported-chunks path and the no-new-chunks path.
 func TestCmdSyncCloudImportPrintsSkippedRelationWarnings(t *testing.T) {
 	stubExitWithPanic(t)
 	stubRuntimeHooks(t)
@@ -4910,26 +4911,47 @@ func TestCmdSyncCloudImportPrintsSkippedRelationWarnings(t *testing.T) {
 		t.Fatalf("close store: %v", err)
 	}
 
-	syncImportWithProgress = func(_ *engramsync.Syncer, report func(engramsync.ImportProgress)) (*engramsync.ImportResult, error) {
-		report(engramsync.ImportProgress{Percentage: 100})
-		report(engramsync.ImportProgress{Percentage: 100})
-		return &engramsync.ImportResult{
-			ChunksImported:       1,
-			SessionsImported:     1,
-			ObservationsImported: 1,
-			SkippedRelations:     []string{"relation obs-a->obs-b: referenced observation missing permanently"},
-		}, nil
+	cases := []struct {
+		name   string
+		result *engramsync.ImportResult
+	}{
+		{
+			name: "imported chunks",
+			result: &engramsync.ImportResult{
+				ChunksImported:       1,
+				SessionsImported:     1,
+				ObservationsImported: 1,
+				SkippedRelations:     []string{"relation obs-a->obs-b: referenced observation missing permanently"},
+			},
+		},
+		{
+			name: "no new chunks",
+			result: &engramsync.ImportResult{
+				ChunksSkipped:    1,
+				SkippedRelations: []string{"relation obs-a->obs-b: referenced observation missing permanently"},
+			},
+		},
 	}
-	syncStatus = func(*engramsync.Syncer) (int, int, int, error) {
-		return 1, 1, 0, nil
-	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			syncImportWithProgress = func(_ *engramsync.Syncer, report func(engramsync.ImportProgress)) (*engramsync.ImportResult, error) {
+				report(engramsync.ImportProgress{Percentage: 100})
+				report(engramsync.ImportProgress{Percentage: 100})
+				return tc.result, nil
+			}
+			syncStatus = func(*engramsync.Syncer) (int, int, int, error) {
+				return 1, 1, 0, nil
+			}
 
-	withArgs(t, "engram", "sync", "--cloud", "--import", "--project", "proj-a")
-	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
-	if recovered != nil || stderr != "" {
-		t.Fatalf("expected successful cloud import, panic=%v stderr=%q", recovered, stderr)
-	}
-	if !strings.Contains(stdout, "WARNING skipped relation obs-a->obs-b: referenced observation missing permanently") {
-		t.Fatalf("expected skipped relation warning in import output, got:\n%s", stdout)
+			withArgs(t, "engram", "sync", "--cloud", "--import", "--project", "proj-a")
+			stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
+			if recovered != nil || stderr != "" {
+				t.Fatalf("expected successful cloud import, panic=%v stderr=%q", recovered, stderr)
+			}
+			if !strings.Contains(stdout, "WARNING skipped relation obs-a->obs-b: referenced observation missing permanently") {
+				t.Fatalf("expected skipped relation warning in import output, got:\n%s", stdout)
+			}
+		})
 	}
 }
