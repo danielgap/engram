@@ -6251,7 +6251,7 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {
 	row := s.db.QueryRow(
 		`SELECT `+observationSelectColumns+`
-		 FROM observations WHERE sync_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`,
+			 FROM observations WHERE sync_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`,
 		syncID,
 	)
 	var o Observation
@@ -6259,6 +6259,23 @@ func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {
 		return nil, err
 	}
 	return &o, nil
+}
+
+// HasObservationBySyncIDAnyState reports whether an observation with the given
+// sync_id exists locally in any deletion state, tombstones included. It mirrors
+// the tombstone-inclusive relation FK precondition (getObservationBySyncIDTx
+// with includeDeleted) for callers outside Store transactions and answers
+// through the idx_obs_sync_id index without materializing an export.
+func (s *Store) HasObservationBySyncIDAnyState(syncID string) (bool, error) {
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM observations WHERE sync_id = ? LIMIT 1`, syncID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check observation sync_id %s: %w", syncID, err)
+	}
+	return true, nil
 }
 
 // ─── Project Enrollment for Cloud Sync ───────────────────────────────────────

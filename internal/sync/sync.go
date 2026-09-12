@@ -1132,9 +1132,6 @@ type importDependencyOracle struct {
 	pendingObservationIDs map[string]struct{}
 	built                 bool
 	buildErr              error
-	allObservationSyncIDs map[string]struct{}
-	exported              bool
-	exportErr             error
 }
 
 func newImportDependencyOracle(sy *Syncer, entries []ChunkEntry, knownChunks map[string]bool) *importDependencyOracle {
@@ -1149,9 +1146,9 @@ func newImportDependencyOracle(sy *Syncer, entries []ChunkEntry, knownChunks map
 // any deletion state or arrives with a chunk still pending in this run.
 // GetObservationBySyncID excludes soft-deleted rows, but the store's relation
 // FK precondition (applyRelationUpsertTx) counts them: an edge whose endpoint
-// is a local tombstone still applies today and must never be skipped. Only a
-// full scan (Export includes tombstones) can distinguish tombstoned endpoints
-// from permanently absent ones, so it runs lazily, at most once per import.
+// is a local tombstone still applies today and must never be skipped.
+// HasObservationBySyncIDAnyState answers tombstone-inclusively through the
+// idx_obs_sync_id index, so classification never materializes an export.
 func (o *importDependencyOracle) endpointSatisfiable(syncID string) (bool, error) {
 	syncID = strings.TrimSpace(syncID)
 	if syncID == "" {
@@ -1163,30 +1160,10 @@ func (o *importDependencyOracle) endpointSatisfiable(syncID string) (bool, error
 	if _, pending := o.pendingObservationIDs[syncID]; pending {
 		return true, nil
 	}
-	if _, err := o.sy.store.GetObservationBySyncID(syncID); err == nil {
-		return true, nil
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	known, err := o.sy.store.HasObservationBySyncIDAnyState(syncID)
+	if err != nil {
 		return false, fmt.Errorf("check relation endpoint %s: %w", syncID, err)
 	}
-	if !o.exported {
-		data, err := storeExportData(o.sy.store)
-		if err != nil {
-			o.exported = true
-			o.exportErr = err
-			return false, fmt.Errorf("check relation endpoints: %w", err)
-		}
-		o.allObservationSyncIDs = make(map[string]struct{}, len(data.Observations))
-		for _, obs := range data.Observations {
-			if id := strings.TrimSpace(obs.SyncID); id != "" {
-				o.allObservationSyncIDs[id] = struct{}{}
-			}
-		}
-		o.exported = true
-	}
-	if o.exportErr != nil {
-		return false, fmt.Errorf("check relation endpoints: %w", o.exportErr)
-	}
-	_, known := o.allObservationSyncIDs[syncID]
 	return known, nil
 }
 

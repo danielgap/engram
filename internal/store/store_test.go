@@ -4433,6 +4433,77 @@ func TestApplyRemoteMutationIdempotent(t *testing.T) {
 	}
 }
 
+// TestStoreHasObservationBySyncIDAnyState pins the tombstone-inclusive
+// existence contract that relation imports rely on: HasObservationBySyncIDAnyState
+// must see live and soft-deleted (tombstoned) rows alike, while
+// GetObservationBySyncID keeps excluding deleted ones.
+func TestStoreHasObservationBySyncIDAnyState(t *testing.T) {
+	s := newTestStore(t)
+
+	create := SyncMutation{
+		Seq:       41,
+		TargetKey: DefaultSyncTargetKey,
+		Entity:    SyncEntitySession,
+		EntityKey: "remote-session",
+		Op:        SyncOpUpsert,
+		Payload:   `{"id":"remote-session","project":"engram","directory":"/remote"}`,
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, create); err != nil {
+		t.Fatalf("apply session mutation: %v", err)
+	}
+
+	obsMutation := SyncMutation{
+		Seq:       42,
+		TargetKey: DefaultSyncTargetKey,
+		Entity:    SyncEntityObservation,
+		EntityKey: "obs-remote-1",
+		Op:        SyncOpUpsert,
+		Payload:   `{"sync_id":"obs-remote-1","session_id":"remote-session","type":"decision","title":"Remote","content":"Pulled from cloud","project":"engram","scope":"project"}`,
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, obsMutation); err != nil {
+		t.Fatalf("apply observation mutation: %v", err)
+	}
+
+	known, err := s.HasObservationBySyncIDAnyState("obs-remote-1")
+	if err != nil {
+		t.Fatalf("check live observation: %v", err)
+	}
+	if !known {
+		t.Fatalf("expected live observation to be visible in any state")
+	}
+
+	absent, err := s.HasObservationBySyncIDAnyState("obs-never-pulled")
+	if err != nil {
+		t.Fatalf("check absent observation: %v", err)
+	}
+	if absent {
+		t.Fatalf("expected absent observation to be invisible in any state")
+	}
+
+	deleteMutation := SyncMutation{
+		Seq:       43,
+		TargetKey: DefaultSyncTargetKey,
+		Entity:    SyncEntityObservation,
+		EntityKey: "obs-remote-1",
+		Op:        SyncOpDelete,
+		Payload:   `{"sync_id":"obs-remote-1","deleted":true}`,
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, deleteMutation); err != nil {
+		t.Fatalf("apply delete mutation: %v", err)
+	}
+	if _, err := s.GetObservationBySyncID("obs-remote-1"); err == nil {
+		t.Fatalf("expected pulled delete to hide observation from GetObservationBySyncID")
+	}
+
+	tombstoned, err := s.HasObservationBySyncIDAnyState("obs-remote-1")
+	if err != nil {
+		t.Fatalf("check tombstoned observation: %v", err)
+	}
+	if !tombstoned {
+		t.Fatalf("expected tombstoned observation to stay visible in any state")
+	}
+}
+
 func TestApplyPulledMutationClearsDegradedReasonFields(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.MarkSyncBlocked(DefaultSyncTargetKey, "blocked_unenrolled", "project not enrolled"); err != nil {
