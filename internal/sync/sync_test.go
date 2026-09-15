@@ -3256,12 +3256,11 @@ func TestCloudSyncPreflightBlocksUnenrolledBeforeTransport(t *testing.T) {
 		t.Fatalf("expected no transport calls before preflight passes, got readManifest=%d writeChunk=%d", transport.readManifestCalls, transport.writeChunkCalls)
 	}
 
-	state, err := s.GetSyncState("cloud:proj-a")
-	if err != nil {
-		t.Fatalf("get sync state: %v", err)
-	}
-	if state.ReasonCode == nil || *state.ReasonCode != "blocked_unenrolled" {
-		t.Fatalf("expected reason_code blocked_unenrolled, got %v", state.ReasonCode)
+	// The blocked-unenrolled preflight still blocks before any transport call,
+	// but it no longer mints a state row for the unenrolled project: the error
+	// is returned to the caller instead of being persisted.
+	if _, err := s.GetSyncState("cloud:proj-a"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unenrolled preflight minted state: err=%v, want sql.ErrNoRows", err)
 	}
 }
 

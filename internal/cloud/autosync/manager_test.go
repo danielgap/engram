@@ -774,8 +774,10 @@ func TestManagerPushQuarantinesOnlyConfiguredTarget(t *testing.T) {
 	if err := local.EnrollProject("alpha"); err != nil {
 		t.Fatalf("enroll alpha: %v", err)
 	}
-	if _, err := local.GetSyncState(targetKey); err != nil {
-		t.Fatalf("initialize configured target state: %v", err)
+	// Custom non-cloud targets are no longer minted on read; seed the state row
+	// the manager under test is configured against.
+	if _, err := local.DB().Exec(`INSERT INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, 'idle', datetime('now'))`, targetKey); err != nil {
+		t.Fatalf("seed configured target state: %v", err)
 	}
 	if _, err := local.DB().Exec(`
 		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)

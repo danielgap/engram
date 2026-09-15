@@ -25,11 +25,14 @@ func TestRepairEnrolledProjectSyncMutationsBackfillsDeletedObservationDelete(t *
 	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
 		t.Fatal(err)
 	}
+	// The observation upsert predates enrollment and stages in the cloud inbox
+	// lane; the delivery lane must carry exactly its own upsert and the
+	// repaired delete.
 	var upserts, deletes int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND op = ?`, SyncEntityObservation, syncID, SyncOpUpsert).Scan(&upserts); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND entity = ? AND entity_key = ? AND op = ?`, DefaultSyncTargetKey, SyncEntityObservation, syncID, SyncOpUpsert).Scan(&upserts); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND op = ?`, SyncEntityObservation, syncID, SyncOpDelete).Scan(&deletes); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND entity = ? AND entity_key = ? AND op = ?`, DefaultSyncTargetKey, SyncEntityObservation, syncID, SyncOpDelete).Scan(&deletes); err != nil {
 		t.Fatal(err)
 	}
 	if upserts != 1 || deletes != 1 {

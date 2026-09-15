@@ -370,6 +370,10 @@ const (
 	// its own sync_state row and never represents an enrollable project.
 	SyncInboxTargetKey = "cloud:inbox"
 
+	// SyncInboxUnsortedProject is the inbox project column value for local
+	// mutations whose routing derivation produced no candidate key.
+	SyncInboxUnsortedProject = "unsorted"
+
 	// ReservedInboxProjectName is the project name the cloud inbox owns. Enrolling
 	// it is rejected because its cloud:<project> target key would collide with
 	// SyncInboxTargetKey.
@@ -1245,7 +1249,9 @@ func primeConnection(db *sql.DB) error {
 	})
 }
 
-const schemaVersion = 1
+// schemaVersion 2 adds sync_project_aliases, the cloud inbox routing alias
+// map (alias_key→project renames and cwd→project mappings).
+const schemaVersion = 2
 
 var migrateRunCount atomic.Int64
 var acquireStartupMigrationLock = acquireMigrationLock
@@ -1859,6 +1865,21 @@ func (s *Store) migrate() error {
 		WHERE target_key = ?
 		  AND (lifecycle <> ? OR last_enqueued_seq <> 0 OR last_acked_seq <> 0 OR last_pulled_seq <> 0)`,
 		SyncLifecycleInbox, SyncInboxTargetKey, SyncLifecycleInbox); err != nil {
+		return err
+	}
+	// Schema v2: the cloud inbox routing alias map. Two entry kinds share the
+	// table: alias_key→project renames and cwd→project mappings for non-repo
+	// working directories. The map governs future derivation only — it never
+	// rewrites journaled history.
+	if _, err := s.execHook(s.db, `
+		CREATE TABLE IF NOT EXISTS sync_project_aliases (
+			alias_key  TEXT PRIMARY KEY,
+			alias_kind TEXT NOT NULL,
+			project    TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+	`); err != nil {
 		return err
 	}
 	if _, err := s.execHook(s.db, `
@@ -2999,6 +3020,9 @@ func (s *Store) cloudUpgradeManualActionReport(project string) (bool, CloudUpgra
 	}
 	state, err := s.GetSyncState(targetKey)
 	if err != nil {
+		if isMissingSyncStateRow(err) {
+			return false, CloudUpgradeRepairReport{}, nil
+		}
 		return false, CloudUpgradeRepairReport{}, fmt.Errorf("read sync state for cloud upgrade repair: %w", err)
 	}
 	if state == nil {
@@ -7887,6 +7911,10 @@ func (s *Store) refreshProjectSyncStateTx(tx *sql.Tx, project string) error {
 	}
 	state, err := s.getSyncStateTx(tx, projectTargetKey)
 	if err != nil {
+		if isMissingSyncStateRow(err) {
+			// Nothing to refresh: unenrolled targets never get a minted row.
+			return nil
+		}
 		return err
 	}
 
@@ -7995,6 +8023,11 @@ func (s *Store) applySyncLifecycleTx(tx *sql.Tx, targetKey string, pendingCount 
 	}
 	state, err := s.getSyncStateTx(tx, targetKey)
 	if err != nil {
+		if isMissingSyncStateRow(err) {
+			// Unenrolled targets never get a minted row, so there is nothing
+			// to refresh — the absence itself is the lifecycle.
+			return nil
+		}
 		return err
 	}
 	lifecycle := SyncLifecycleHealthy
@@ -8100,6 +8133,9 @@ func (s *Store) markSyncBlocked(targetKey, reasonCode, message string, recordSuc
 	}
 	return s.withTx(func(tx *sql.Tx) error {
 		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			if isMissingSyncStateRow(err) {
+				return nil
+			}
 			return err
 		}
 		_, err := s.execHook(tx,
@@ -8139,6 +8175,9 @@ func (s *Store) MarkSyncFailureWithReason(targetKey, reasonCode, message string,
 	return s.withTx(func(tx *sql.Tx) error {
 		state, err := s.getSyncStateTx(tx, targetKey)
 		if err != nil {
+			if isMissingSyncStateRow(err) {
+				return nil
+			}
 			return err
 		}
 		_, err = s.execHook(tx,
@@ -8158,6 +8197,9 @@ func (s *Store) MarkSyncHealthy(targetKey string) error {
 	}
 	return s.withTx(func(tx *sql.Tx) error {
 		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			if isMissingSyncStateRow(err) {
+				return nil
+			}
 			return err
 		}
 		_, err := s.execHook(tx,
@@ -8177,6 +8219,9 @@ func (s *Store) MarkSyncPending(targetKey string) error {
 	}
 	return s.withTx(func(tx *sql.Tx) error {
 		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			if isMissingSyncStateRow(err) {
+				return nil
+			}
 			return err
 		}
 		_, err := s.execHook(tx,
@@ -8559,6 +8604,9 @@ func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations [
 
 	return s.withTx(func(tx *sql.Tx) error {
 		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			if isMissingSyncStateRow(err) {
+				return nil
+			}
 			return err
 		}
 
@@ -8787,6 +8835,99 @@ func (s *Store) IsProjectEnrolled(project string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// ─── Cloud Inbox Routing: project alias map ──────────────────────────────
+
+// Entry kinds stored in sync_project_aliases: alias_key→project renames and
+// cwd→project mappings for non-repository working directories.
+const (
+	syncProjectAliasKindKey = "alias"
+	syncProjectAliasKindCwd = "cwd"
+)
+
+// RegisterSyncProjectAlias maps a candidate project key to its canonical
+// project for future cloud inbox routing. The mapping governs future
+// derivation only — already-journaled rows keep their original project.
+// Re-registering a key upserts its target. Like enrollment, the target may
+// not be the reserved inbox project name.
+func (s *Store) RegisterSyncProjectAlias(aliasKey, project string) error {
+	aliasKey, _ = NormalizeProject(aliasKey)
+	if aliasKey == "" {
+		return fmt.Errorf("alias key must not be empty")
+	}
+	project, _ = NormalizeProject(project)
+	if project == "" {
+		return fmt.Errorf("project name must not be empty")
+	}
+	if project == ReservedInboxProjectName {
+		return fmt.Errorf("project name %q is reserved for the cloud inbox and cannot be an alias target", project)
+	}
+	return s.registerSyncProjectAliasRow(aliasKey, syncProjectAliasKindKey, project)
+}
+
+// RegisterSyncProjectCwd maps a non-repository working directory to a project
+// for future cloud inbox routing. The directory is canonicalized through the
+// same runtime worktree identity the enqueue-path lookup uses, so different
+// spellings of one directory share a single row.
+func (s *Store) RegisterSyncProjectCwd(cwd, project string) error {
+	// Reject blank input before canonicalization: RuntimeWorktreeDirectory maps
+	// an empty directory to the process working directory, which is never the
+	// mapping the caller meant to register.
+	if strings.TrimSpace(cwd) == "" {
+		return fmt.Errorf("working directory must not be empty")
+	}
+	cwd = projectpkg.RuntimeWorktreeDirectory(cwd)
+	if cwd == "" {
+		return fmt.Errorf("working directory must not be empty")
+	}
+	project, _ = NormalizeProject(project)
+	if project == "" {
+		return fmt.Errorf("project name must not be empty")
+	}
+	if project == ReservedInboxProjectName {
+		return fmt.Errorf("project name %q is reserved for the cloud inbox and cannot be a cwd alias target", project)
+	}
+	return s.registerSyncProjectAliasRow(cwd, syncProjectAliasKindCwd, project)
+}
+
+// registerSyncProjectAliasRow upserts one alias-map entry. Re-registering a
+// key retargets it, including across kinds.
+func (s *Store) registerSyncProjectAliasRow(key, kind, project string) error {
+	_, err := s.execHook(s.db, `
+		INSERT INTO sync_project_aliases (alias_key, alias_kind, project) VALUES (?, ?, ?)
+		ON CONFLICT(alias_key) DO UPDATE SET
+			alias_kind = excluded.alias_kind,
+			project = excluded.project,
+			updated_at = datetime('now')`,
+		key, kind, project,
+	)
+	return err
+}
+
+// lookupSyncProjectAliasTx resolves an alias_key→project mapping, or "".
+func (s *Store) lookupSyncProjectAliasTx(tx *sql.Tx, aliasKey string) (string, error) {
+	return s.lookupSyncProjectAliasKindTx(tx, syncProjectAliasKindKey, aliasKey)
+}
+
+// lookupSyncProjectCwdTx resolves a cwd→project mapping, or "".
+func (s *Store) lookupSyncProjectCwdTx(tx *sql.Tx, cwd string) (string, error) {
+	return s.lookupSyncProjectAliasKindTx(tx, syncProjectAliasKindCwd, cwd)
+}
+
+func (s *Store) lookupSyncProjectAliasKindTx(tx *sql.Tx, kind, key string) (string, error) {
+	if strings.TrimSpace(key) == "" {
+		return "", nil
+	}
+	var project string
+	err := tx.QueryRow(`SELECT project FROM sync_project_aliases WHERE alias_kind = ? AND alias_key = ?`, kind, key).Scan(&project)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return project, nil
 }
 
 // ─── Project Migration ───────────────────────────────────────────────────────
@@ -10082,11 +10223,47 @@ func nullableOwnershipMode(mode string) any {
 }
 
 func (s *Store) ensureSyncState(targetKey string) error {
-	_, err := s.execHook(s.db,
+	allowed, err := syncStateMintAllowed(targetKey, s.IsProjectEnrolled)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return nil
+	}
+	_, err = s.execHook(s.db,
 		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
 		targetKey, SyncLifecycleIdle,
 	)
 	return err
+}
+
+// syncStateMintAllowed reports whether creating a sync_state row for targetKey
+// is allowed. Mint-on-read stays reserved for the fixed delivery targets — the
+// legacy cloud lane, the reserved cloud inbox, and local chunk targets — plus
+// cloud:<enrolled> project targets. Rows for unenrolled projects are never
+// minted on read or touch; the cloud inbox owns unenrolled journal routing
+// instead. isEnrolled is injected so transactional and database-backed callers
+// share one rule.
+func syncStateMintAllowed(targetKey string, isEnrolled func(project string) (bool, error)) (bool, error) {
+	normalized := normalizeSyncTargetKey(targetKey)
+	switch normalized {
+	case DefaultSyncTargetKey, SyncInboxTargetKey, LocalChunkTargetKey:
+		return true, nil
+	}
+	if project, ok := strings.CutPrefix(normalized, DefaultSyncTargetKey+":"); ok {
+		if project == "" || isEnrolled == nil {
+			return false, nil
+		}
+		return isEnrolled(project)
+	}
+	return false, nil
+}
+
+// isMissingSyncStateRow reports whether err means the sync_state row does not
+// exist for an unmintable target: lifecycle setters treat it as nothing to
+// mark instead of an error.
+func isMissingSyncStateRow(err error) bool {
+	return errors.Is(err, sql.ErrNoRows)
 }
 
 // SyncTargetState summarizes one sync_state row for diagnostics.
@@ -10245,11 +10422,19 @@ func (s *Store) getSyncState(targetKey string) (*SyncState, error) {
 }
 
 func (s *Store) getSyncStateTx(tx *sql.Tx, targetKey string) (*SyncState, error) {
-	if _, err := s.execHook(tx,
-		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
-		targetKey, SyncLifecycleIdle,
-	); err != nil {
+	allowed, err := syncStateMintAllowed(targetKey, func(project string) (bool, error) {
+		return isProjectEnrolledTx(tx, project)
+	})
+	if err != nil {
 		return nil, err
+	}
+	if allowed {
+		if _, err := s.execHook(tx,
+			`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
+			targetKey, SyncLifecycleIdle,
+		); err != nil {
+			return nil, err
+		}
 	}
 	row := tx.QueryRow(`
 		SELECT target_key, lifecycle, last_enqueued_seq, last_acked_seq, last_pulled_seq,
@@ -11328,6 +11513,54 @@ func (s *Store) enqueueSyncMutationWithSourceTx(tx *sql.Tx, entity, entityKey, o
 			}
 		}
 	}
+	// ── Stage A: routing candidate derivation ────────────────────────────────
+	// (a) explicit designation — the payload project or the owning session's
+	// project — is handled above. (b) Otherwise, for local writes, derive the
+	// candidate from the repository NAME of the session's directory through the
+	// read-only repository resolver. (c) Otherwise no candidate: the inbox
+	// routing below journals under the unsorted key. Derivation never rewrites
+	// the payload bytes.
+	sessionDirectory := ""
+	if source == SyncSourceLocal {
+		sessionDirectory = sessionDirectoryForRoutingTx(tx, payload)
+		if project == "" && sessionDirectory != "" {
+			if root := projectpkg.RepositoryRoot(sessionDirectory); root != "" {
+				project = slugifyRepositoryName(filepath.Base(root))
+			}
+		}
+	}
+
+	// ── Stage B: target resolution (local writes only) ───────────────────────
+	// (1) the alias map resolves renames and non-repo working directories;
+	// (2) an enrolled candidate keeps today's delivery lane; (3) everything
+	// else routes to the reserved cloud inbox — observations and relations are
+	// journaled there, telemetry is not journaled at all. Non-local sources
+	// keep today's behavior entirely.
+	if source == SyncSourceLocal {
+		resolved, resolveErr := s.resolveSyncRoutingProjectTx(tx, project, sessionDirectory)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		project = resolved
+		enrolled := false
+		if project != "" {
+			enrolled, err = isProjectEnrolledTx(tx, project)
+			if err != nil {
+				return err
+			}
+		}
+		if !enrolled {
+			if entity == SyncEntitySession || entity == SyncEntityPrompt {
+				// Unenrolled telemetry never journals, not even to the inbox.
+				return nil
+			}
+			inboxProject := project
+			if inboxProject == "" {
+				inboxProject = SyncInboxUnsortedProject
+			}
+			return s.journalInboxMutationTx(tx, entity, entityKey, op, encoded, source, inboxProject)
+		}
+	}
 	// Cloud journal delivery is opt-in per project. Local writes remain durable in
 	// SQLite while an unenrolled project accumulates no cloud mutation rows; the
 	// enrollment backfill materializes its current local state once it opts in.
@@ -11401,6 +11634,78 @@ func syncTargetKeyForProject(project string) string {
 		return DefaultSyncTargetKey
 	}
 	return fmt.Sprintf("%s:%s", DefaultSyncTargetKey, project)
+}
+
+// sessionDirectoryForRoutingTx returns the directory that anchors Stage-A
+// repository resolution: the payload directory for session payloads, otherwise
+// the owning session's stored directory. A missing session row resolves to
+// "" so routing falls through to the unsorted key.
+func sessionDirectoryForRoutingTx(tx *sql.Tx, payload any) string {
+	if session, ok := payload.(syncSessionPayload); ok {
+		return strings.TrimSpace(session.Directory)
+	}
+	sessionID := extractSessionIDFromPayload(payload)
+	if sessionID == "" {
+		return ""
+	}
+	var directory string
+	err := tx.QueryRow(`SELECT ifnull(directory, '') FROM sessions WHERE id = ?`, sessionID).Scan(&directory)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(directory)
+}
+
+// slugifyRepositoryName normalizes a repository NAME into a sync routing key:
+// lowercase, with spaces and underscores collapsed into single hyphens. It is
+// never applied to path basenames — the dir_basename cross-repo plugin
+// contract is a different derivation seam.
+func slugifyRepositoryName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.NewReplacer(" ", "-", "_", "-").Replace(name)
+	for strings.Contains(name, "--") {
+		name = strings.ReplaceAll(name, "--", "-")
+	}
+	return strings.Trim(name, "-")
+}
+
+// resolveSyncRoutingProjectTx applies the alias map to a Stage-A candidate:
+// an alias_key hit wins, then a cwd hit for the session's directory. The
+// resolved key (or the unchanged candidate) governs enrollment and inbox
+// routing; the map never rewrites already-journaled history.
+func (s *Store) resolveSyncRoutingProjectTx(tx *sql.Tx, candidate, sessionDirectory string) (string, error) {
+	if candidate != "" {
+		alias, err := s.lookupSyncProjectAliasTx(tx, candidate)
+		if err != nil {
+			return "", err
+		}
+		if alias != "" {
+			return alias, nil
+		}
+	}
+	if sessionDirectory != "" {
+		alias, err := s.lookupSyncProjectCwdTx(tx, projectpkg.RuntimeWorktreeDirectory(sessionDirectory))
+		if err != nil {
+			return "", err
+		}
+		if alias != "" {
+			return alias, nil
+		}
+	}
+	return candidate, nil
+}
+
+// journalInboxMutationTx journals one local unenrolled mutation to the
+// reserved cloud inbox target. The inbox owns its permanent bootstrap
+// sync_state row: no per-project state is minted and no delivery cursor
+// advances — the inbox delivery lane is a later slice.
+func (s *Store) journalInboxMutationTx(tx *sql.Tx, entity, entityKey, op string, payload []byte, source, project string) error {
+	_, err := s.execHook(tx,
+		`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		SyncInboxTargetKey, entity, entityKey, op, string(payload), source, project,
+	)
+	return err
 }
 
 func extractSessionIDFromPayload(payload any) string {

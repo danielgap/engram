@@ -1396,6 +1396,11 @@ func TestCmdCloudUpgradeDoctorRequiresProjectAndIsDeterministic(t *testing.T) {
 			t.Fatalf("open store: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Close() })
+		// cloud:<unenrolled> rows are no longer minted on touch; enroll the
+		// subject project so the seeded policy state exists for doctor to read.
+		if err := s.EnrollProject("proj-a"); err != nil {
+			t.Fatalf("enroll proj-a: %v", err)
+		}
 		targetKey := cloudTargetKeyForProject("proj-a")
 		if err := s.MarkSyncBlocked(targetKey, constants.ReasonPolicyForbidden, "project blocked by org policy"); err != nil {
 			t.Fatalf("seed policy denied sync state: %v", err)
@@ -3560,12 +3565,11 @@ func TestCmdSyncCloudPreflightMissingServerMarksConfigError(t *testing.T) {
 		t.Fatalf("store.New: %v", err)
 	}
 	defer s.Close()
-	state, err := s.GetSyncState(cloudTargetKeyForProject("proj-a"))
-	if err != nil {
-		t.Fatalf("get sync state: %v", err)
-	}
-	if state.ReasonCode == nil || *state.ReasonCode != "cloud_config_error" {
-		t.Fatalf("expected cloud_config_error reason code, got %v", state.ReasonCode)
+	// The cloud_config_error still fails the command (asserted above), but the
+	// preflight for an unenrolled project must not mint a cloud:proj-a state
+	// row anymore — the error is returned, not persisted.
+	if _, err := s.GetSyncState(cloudTargetKeyForProject("proj-a")); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("preflight minted state for unenrolled project: err=%v, want sql.ErrNoRows", err)
 	}
 }
 
@@ -3797,6 +3801,11 @@ func TestMarkCloudSyncFailureClassifiesHTTPStatusCodes(t *testing.T) {
 				t.Fatalf("store.New: %v", err)
 			}
 			defer s.Close()
+			// cloud:<unenrolled> rows are no longer minted on touch; enroll the
+			// subject project so the failure state can be stored and read back.
+			if err := s.EnrollProject("proj-a"); err != nil {
+				t.Fatalf("enroll proj-a: %v", err)
+			}
 			targetKey := cloudTargetKeyForProject("proj-a")
 			markCloudSyncFailure(s, targetKey, tc.syncErr)
 
@@ -3818,6 +3827,9 @@ func TestMarkCloudSyncFailureStoresRepairGuidance(t *testing.T) {
 		t.Fatalf("store.New: %v", err)
 	}
 	defer s.Close()
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll proj-a: %v", err)
+	}
 
 	targetKey := cloudTargetKeyForProject("proj-a")
 	syncErr := &remote.HTTPStatusError{

@@ -437,6 +437,22 @@ func (p storeSyncStatusProvider) Status(project string) server.SyncStatus {
 			UpgradeReasonMessage: upgradeMessage,
 		}
 	}
+	// A project-scoped status read no longer mints a sync_state row for an
+	// unenrolled project (the store reserves minting for enrolled targets), so
+	// report the enrollment blocker instead of a degraded read failure.
+	if resolvedProject != "" {
+		if enrolled, enrollErr := p.store.IsProjectEnrolled(resolvedProject); enrollErr == nil && !enrolled {
+			return server.SyncStatus{
+				Enabled:              false,
+				Phase:                store.SyncLifecycleIdle,
+				ReasonCode:           constants.ReasonBlockedUnenrolled,
+				ReasonMessage:        fmt.Sprintf("project %q is not enrolled for cloud sync", resolvedProject),
+				UpgradeStage:         upgradeStage,
+				UpgradeReasonCode:    upgradeCode,
+				UpgradeReasonMessage: upgradeMessage,
+			}
+		}
+	}
 	state, err := p.store.GetSyncState(targetKey)
 	if err != nil {
 		reason := "sync state is unavailable"

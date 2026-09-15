@@ -5113,6 +5113,11 @@ func TestAckSyncMutationsRefreshesProjectStateAndClearsDegradedMetadata(t *testi
 
 func TestAckSyncMutationsPreservesActivelyDegradedProjectState(t *testing.T) {
 	s := newTestStore(t)
+	// cloud:<unenrolled> rows are no longer minted on touch; enroll the subject
+	// project so the seeded degraded state exists for the ack-preservation check.
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll proj-a: %v", err)
+	}
 	targetKey := syncTargetKeyForProject("proj-a")
 	if err := s.MarkSyncBlocked(targetKey, "blocked_unenrolled", "project is blocked by policy"); err != nil {
 		t.Fatalf("seed actively degraded state: %v", err)
@@ -5379,12 +5384,15 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 			t.Fatalf("enroll project: %v", err)
 		}
 
+		// The pre-enrollment observation journals to the cloud inbox; the
+		// repairable condition under test is a gap in the delivery lane, so
+		// the setup must remove a delivery-lane row.
 		if _, err := s.execHook(s.db, `
 			DELETE FROM sync_mutations
 			WHERE seq IN (
-				SELECT seq FROM sync_mutations WHERE project = ? AND entity = ? ORDER BY seq ASC LIMIT 1
+				SELECT seq FROM sync_mutations WHERE project = ? AND entity = ? AND target_key = ? ORDER BY seq ASC LIMIT 1
 			)
-		`, "repair-proj", SyncEntityObservation); err != nil {
+		`, "repair-proj", SyncEntityObservation, DefaultSyncTargetKey); err != nil {
 			t.Fatalf("delete mutation for repair setup: %v", err)
 		}
 
@@ -5431,9 +5439,9 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 		if _, err := s.execHook(s.db, `
 			DELETE FROM sync_mutations
 			WHERE seq IN (
-				SELECT seq FROM sync_mutations WHERE project = ? AND entity = ? ORDER BY seq ASC LIMIT 1
+				SELECT seq FROM sync_mutations WHERE project = ? AND entity = ? AND target_key = ? ORDER BY seq ASC LIMIT 1
 			)
-		`, "repair-apply", SyncEntityObservation); err != nil {
+		`, "repair-apply", SyncEntityObservation, DefaultSyncTargetKey); err != nil {
 			t.Fatalf("delete mutation for apply setup: %v", err)
 		}
 
@@ -5486,6 +5494,11 @@ func TestUpgradeRepairDryRunAndApply(t *testing.T) {
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
 				s := newTestStore(t)
+				// cloud:<unenrolled> rows are no longer minted on touch; enroll the
+				// subject project so the seeded blocker state exists.
+				if err := s.EnrollProject("repair-policy"); err != nil {
+					t.Fatalf("enroll repair-policy: %v", err)
+				}
 				if err := s.MarkSyncBlocked("cloud:repair-policy", tc.reasonCode, tc.message); err != nil {
 					t.Fatalf("seed sync blocked state: %v", err)
 				}
@@ -6009,6 +6022,11 @@ func TestMarkSyncBlockedResetsConsecutiveFailures(t *testing.T) {
 
 func TestMarkSyncHealthyCreatesSyncStateWhenMissing(t *testing.T) {
 	s := newTestStore(t)
+	// Mint-on-touch remains reserved for enrolled targets; enroll so the
+	// missing-row creation contract still applies.
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll proj-a: %v", err)
+	}
 	targetKey := "cloud:proj-a"
 
 	if err := s.MarkSyncHealthy(targetKey); err != nil {
@@ -6029,6 +6047,9 @@ func TestMarkSyncHealthyCreatesSyncStateWhenMissing(t *testing.T) {
 
 func TestLastSuccessAtChangesOnlyWhenSyncBecomesHealthy(t *testing.T) {
 	s := newTestStore(t)
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll proj-a: %v", err)
+	}
 	targetKey := "cloud:proj-a"
 
 	state, err := s.GetSyncState(targetKey)
@@ -6070,6 +6091,9 @@ func TestLastSuccessAtChangesOnlyWhenSyncBecomesHealthy(t *testing.T) {
 
 func TestMarkSyncPendingClearsDegradedMetadata(t *testing.T) {
 	s := newTestStore(t)
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll proj-a: %v", err)
+	}
 	targetKey := "cloud:proj-a"
 
 	if err := s.MarkSyncFailure(targetKey, "dial tcp timeout", time.Now().UTC().Add(30*time.Second)); err != nil {
@@ -11251,8 +11275,30 @@ func TestUnenrolledHardDeletesReplayAfterReenrollment(t *testing.T) {
 		if err := s.DeleteObservation(observationID, true); err != nil {
 			t.Fatal(err)
 		}
-		if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_mutations`); got != 0 {
-			t.Fatalf("unenrolled hard delete wrote %d sync mutations, want 0", got)
+		// Unenrolled observation history now journals to the cloud inbox: the
+		// pre-enrollment upsert and the hard delete. The delivery lane stays
+		// empty until enrollment backfills it.
+		if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_mutations WHERE target_key = ?`, DefaultSyncTargetKey); got != 0 {
+			t.Fatalf("unenrolled hard delete wrote %d delivery-lane mutations, want 0", got)
+		}
+		inboxOps := map[string]int{}
+		rows, err := s.db.Query(`SELECT op FROM sync_mutations WHERE target_key = ?`, SyncInboxTargetKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var op string
+			if err := rows.Scan(&op); err != nil {
+				t.Fatal(err)
+			}
+			inboxOps[op]++
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		rows.Close()
+		if inboxOps[SyncOpUpsert] != 1 || inboxOps[SyncOpDelete] != 1 {
+			t.Fatalf("inbox mutations = %v, want one upsert and one delete", inboxOps)
 		}
 
 		if err := s.EnrollProject(project); err != nil {
@@ -14709,6 +14755,9 @@ func TestQuarantineIrreparableSyncMutationsQuarantinesEmptyProject(t *testing.T)
 func TestQuarantineIrreparableSyncMutationsRefreshesAffectedLifecycles(t *testing.T) {
 	t.Run("clears stale default and project lifecycle", func(t *testing.T) {
 		s := newTestStore(t)
+		if err := s.EnrollProject("project-a"); err != nil {
+			t.Fatalf("enroll project-a: %v", err)
+		}
 		const payload = `{"id":"poison"}`
 		if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES ('cloud', 'session', 'poison', 'upsert', ?, 'local', 'project-a')`, payload); err != nil {
 			t.Fatalf("seed poison mutation: %v", err)
@@ -14756,6 +14805,12 @@ func TestQuarantineIrreparableSyncMutationsRefreshesAffectedLifecycles(t *testin
 
 	t.Run("preserves pending lifecycle and refreshes only quarantined project", func(t *testing.T) {
 		s := newTestStore(t)
+		if err := s.EnrollProject("project-a"); err != nil {
+			t.Fatalf("enroll project-a: %v", err)
+		}
+		if err := s.EnrollProject("project-b"); err != nil {
+			t.Fatalf("enroll project-b: %v", err)
+		}
 		for _, mutation := range []struct{ key, project, payload string }{
 			{key: "poison", project: "project-a", payload: `{"id":"poison"}`},
 			{key: "pending", project: "project-b", payload: `{"id":"pending","project":"project-b"}`},
@@ -14788,6 +14843,9 @@ func TestQuarantineIrreparableSyncMutationsRefreshesAffectedLifecycles(t *testin
 
 func TestQuarantineIrreparableSyncMutationsKeepsProjectPendingWhenWorkRemains(t *testing.T) {
 	s := newTestStore(t)
+	if err := s.EnrollProject("project-a"); err != nil {
+		t.Fatalf("enroll project-a: %v", err)
+	}
 	if err := s.CreateSession("keep", "project-a", "/work/project-a"); err != nil {
 		t.Fatalf("create session: %v", err)
 	}

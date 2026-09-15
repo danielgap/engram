@@ -111,6 +111,10 @@ func TestCleanupForeignSyncTargetsPreservesJournalAndValidTargets(t *testing.T) 
 
 func TestPolicyFailureReasonAndCloudSummaryUseProjectState(t *testing.T) {
 	s := newTestStore(t)
+	// cloud:<unenrolled> rows are no longer minted on touch.
+	if err := s.EnrollProject("policy-project"); err != nil {
+		t.Fatalf("enroll policy-project: %v", err)
+	}
 	message := "policy denial guidance"
 	if err := s.MarkSyncFailureWithReason("cloud:policy-project", "policy_forbidden", message, time.Now().Add(time.Minute)); err != nil {
 		t.Fatalf("mark policy failure: %v", err)
@@ -140,6 +144,11 @@ func TestPolicyFailureReasonAndCloudSummaryUseProjectState(t *testing.T) {
 
 func TestCloudSyncSummaryUsesStableTargetKeyForEqualTimestamps(t *testing.T) {
 	s := newTestStore(t)
+	for _, project := range []string{"bravo", "alpha"} {
+		if err := s.EnrollProject(project); err != nil {
+			t.Fatalf("enroll %s: %v", project, err)
+		}
+	}
 	fixedTime := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 	if err := s.MarkSyncFailureWithReason("cloud:bravo", "transport_failed", "bravo failure", fixedTime); err != nil {
 		t.Fatalf("mark bravo failure: %v", err)
@@ -165,6 +174,9 @@ func TestCloudSyncSummaryUsesStableTargetKeyForEqualTimestamps(t *testing.T) {
 
 func TestMarkSyncFailureWithReasonDefaultsWhitespaceReasonCode(t *testing.T) {
 	s := newTestStore(t)
+	if err := s.EnrollProject("policy-project"); err != nil {
+		t.Fatalf("enroll policy-project: %v", err)
+	}
 	fixedTime := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 	if err := s.MarkSyncFailureWithReason("cloud:policy-project", " \t ", "sync failed", fixedTime); err != nil {
 		t.Fatalf("mark sync failure: %v", err)

@@ -65,6 +65,11 @@ func TestCloudStatusDiagnosticUsesProjectScopedPolicyGuidance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
+	// cloud:<unenrolled> rows are no longer minted on touch; enroll the subject
+	// project so the seeded policy state exists for the diagnostic to read.
+	if err := s.EnrollProject("policy-project"); err != nil {
+		t.Fatalf("enroll policy-project: %v", err)
+	}
 	message := `cloud: push: status 403: sync denied for project "policy-project"` + "\n\n" + syncguidance.PolicyGuidance("policy-project")
 	if err := s.MarkSyncFailureWithReason("cloud:policy-project", "policy_forbidden", message, time.Now().Add(time.Minute)); err != nil {
 		t.Fatalf("mark project policy failure: %v", err)

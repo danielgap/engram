@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -430,6 +432,12 @@ func cmdCloudUpgradeDoctor(cfg store.Config) {
 func cloudUpgradePolicyDenied(s *store.Store, project string) (bool, error) {
 	state, err := s.GetSyncState(cloudTargetKeyForProject(project))
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// The mint guard reserves sync_state rows for enrolled targets,
+			// so a project without a row has no recorded policy denial —
+			// absence is not denial.
+			return false, nil
+		}
 		return false, err
 	}
 	if state == nil {
