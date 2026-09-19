@@ -1323,7 +1323,11 @@ func seedDoctorOrphanObservationAt(t *testing.T, cfg store.Config, syncID, sessi
 	if err != nil {
 		t.Fatalf("open database: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
 		t.Fatalf("disable foreign keys: %v", err)
 	}
@@ -1429,7 +1433,11 @@ func TestCmdDoctorRepairOrphanedObservationSessionPlanDryRunApplyLifecycle(t *te
 	if err != nil {
 		t.Fatalf("reopen after apply: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close reopened database: %v", err)
+		}
+	}()
 	assertPlaceholder := func(sessionID, project, ownership, timestamp string) {
 		t.Helper()
 		var directory, startedAt, endedAt, gotOwnership, summary string
@@ -1529,7 +1537,11 @@ func seedDoctorOrphanedObservation(t *testing.T, cfg store.Config, syncID, sessi
 	if err != nil {
 		t.Fatalf("open database: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	}()
 	if _, err := db.Exec(`
 		PRAGMA foreign_keys = OFF;
 		INSERT INTO observations
