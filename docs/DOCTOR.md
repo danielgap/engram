@@ -12,6 +12,9 @@ engram doctor --check sync_mutation_required_fields
 engram doctor repair --project sias-app --check session_project_directory_mismatch --plan
 engram doctor repair --project sias-app --check session_project_directory_mismatch --dry-run
 engram doctor repair --project sias-app --check session_project_directory_mismatch --apply
+engram doctor acknowledge --check orphaned_observation_session --project engram --note "accepted by ops"
+engram doctor acknowledge --check orphaned_observation_session --revoke
+engram doctor acknowledge --check orphaned_observation_session --revoke --fingerprint <hex>
 ```
 
 Flags:
@@ -20,6 +23,28 @@ Flags:
 - `--project PROJECT` scopes checks to a normalized project name.
 - `--check CODE` runs one registered check and fails loudly for unknown codes.
 - `doctor repair` supports exactly `invalid_session_identity`, `manual_session_name_project_mismatch`, `orphaned_observation_session`, `session_project_directory_mismatch`, `sync_mutation_required_fields`, and `sync_target_closed_space`. It requires `--project`, `--check`, and exactly one mode: `--plan`, `--dry-run`, or `--apply`. `sync_mutation_required_fields` may omit `--project` and the mode; an omitted mode defaults to `--dry-run`. Its optional project scopes title repair, supersession, quarantine, and source-title repair. The diagnostic-only checks are `ambiguous_active_runtime_sessions`, `sqlite_lock_contention`, and `unowned_session_project`; a rejected repair names the corresponding `engram doctor --check <code>` continuation.
+
+## Acknowledgements
+
+`engram doctor acknowledge` persists a human acceptance of individual doctor findings, so a finding a human has reviewed and accepted stops re-reporting on every run without anyone editing the underlying data.
+
+```bash
+# Acknowledge every finding a check currently reports for one project:
+engram doctor acknowledge --check orphaned_observation_session --project engram --note "accepted by ops"
+
+# Revoke one acknowledgement by fingerprint, or all acknowledgements of a check:
+engram doctor acknowledge --check orphaned_observation_session --revoke --fingerprint <hex>
+engram doctor acknowledge --check orphaned_observation_session --revoke
+```
+
+Semantics:
+
+- Each acknowledgement is stored locally in `doctor_acknowledgements`, keyed by the check code and the sha256 fingerprint of the finding's evidence (the full 64-character hex; CLI output truncates to the first 12 characters for display). Identical evidence keeps its acknowledgement across runs; any change to the evidence value is a new, unacknowledged finding. `--note` records the acceptance rationale.
+- The command runs the requested check scoped by `--project`, acknowledges exactly the findings that run reports, and prints one line per acknowledged finding plus a total. When the check reports nothing, nothing is acknowledged and the command exits 0. `--json` prints a stable envelope (`mode`, `count`, `acknowledged` entries, or `fingerprint` for revocations). There are no interactive prompts; everything is explicit flags.
+- Report filtering: acknowledged findings are removed from `engram doctor` output. Active findings alone drive a check's severity and the report status; a check whose findings are all acknowledged reports `ok` with `acknowledged_count` set, and a mixed check keeps its active severity with `acknowledged_count` reporting the rest. Both fields are omitted when empty so unaffected reports keep their shape.
+- Self-prune rule: a full unscoped `engram doctor` run proves which acknowledgements still match live evidence, so it deletes rows whose evidence no longer exists and reports the total as `acknowledgements_pruned` (text line `acknowledged (N pruned)`). Single-check runs and `engram doctor acknowledge` never prune: a scoped run does not prove the absence of evidence other scopes would still find.
+- Allowlist: acknowledging is restricted to `AcknowledgeableCodes()` — currently `orphaned_observation_session` and `ambiguous_active_runtime_sessions`. It exists for diagnostic-only findings a human has accepted. Repairable checks stay out of it deliberately: their honest exit is the repair itself, not a persisted silence, so an acknowledged row can never stand in for work the repair path exists to do.
+- Revocation is explicit: `--revoke` without `--fingerprint` removes every acknowledgement for the check and prints the count; with `--fingerprint` it removes that single row. Acknowledgements are local operator state: they journal no sync mutations, never alter findings or observations, and are not replicated.
 
 ## MCP
 

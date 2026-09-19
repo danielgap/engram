@@ -218,6 +218,210 @@ func (s *Store) ListOrphanedObservationSessionEvidence(project string) ([]Orphan
 	return evidence, nil
 }
 
+// DoctorAcknowledgement is one persisted operator acceptance of a doctor
+// finding. The row is keyed by the check code and the sha256 fingerprint of
+// the finding's evidence, so the same accepted evidence keeps its
+// acknowledgement across runs while changed evidence is a new finding.
+type DoctorAcknowledgement struct {
+	CheckID             string `json:"check_id"`
+	EvidenceFingerprint string `json:"evidence_fingerprint"`
+	Note                string `json:"note,omitempty"`
+	CreatedAt           string `json:"created_at"`
+	LastSeenAt          string `json:"last_seen_at"`
+}
+
+// DoctorAcknowledgementInput is one acknowledgement row to upsert. Note may be
+// empty; an upsert always overwrites the stored note with the input's value.
+type DoctorAcknowledgementInput struct {
+	CheckID             string
+	EvidenceFingerprint string
+	Note                string
+}
+
+// ListDoctorAcknowledgements returns the persisted acknowledgements for one
+// check code in stable fingerprint order. It is read-only.
+func (s *Store) ListDoctorAcknowledgements(ctx context.Context, checkID string) ([]DoctorAcknowledgement, error) {
+	rows, err := s.queryItContextHook(ctx, `
+		SELECT check_id, evidence_fingerprint, ifnull(note, ''), created_at, last_seen_at
+		FROM doctor_acknowledgements
+		WHERE check_id = ?
+		ORDER BY evidence_fingerprint ASC`, strings.TrimSpace(checkID))
+	if err != nil {
+		return nil, err
+	}
+	acknowledgements := make([]DoctorAcknowledgement, 0)
+	for rows.Next() {
+		var ack DoctorAcknowledgement
+		if err := rows.Scan(&ack.CheckID, &ack.EvidenceFingerprint, &ack.Note, &ack.CreatedAt, &ack.LastSeenAt); err != nil {
+			return nil, closeRowsWithError(rows, err)
+		}
+		acknowledgements = append(acknowledgements, ack)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, closeRowsWithError(rows, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return acknowledgements, nil
+}
+
+// UpsertDoctorAcknowledgements writes every entry in one transaction, keyed by
+// (check_id, evidence_fingerprint). Re-upserting a known fingerprint updates
+// its note and last_seen_at without duplicating the row, so repeated
+// acknowledgement runs are idempotent. Blank check IDs or fingerprints are
+// dropped; the returned count is the number of rows written.
+func (s *Store) UpsertDoctorAcknowledgements(ctx context.Context, entries []DoctorAcknowledgementInput) (int64, error) {
+	_ = ctx
+	normalized := normalizeDoctorAcknowledgementInputs(entries)
+	if len(normalized) == 0 {
+		return 0, nil
+	}
+	var written int64
+	err := s.withTx(func(tx *sql.Tx) error {
+		written = 0
+		for _, entry := range normalized {
+			result, err := s.execHook(tx, `
+				INSERT INTO doctor_acknowledgements (check_id, evidence_fingerprint, note)
+				VALUES (?, ?, ?)
+				ON CONFLICT(check_id, evidence_fingerprint) DO UPDATE SET
+					note = excluded.note,
+					last_seen_at = datetime('now')`,
+				entry.CheckID, entry.EvidenceFingerprint, entry.Note)
+			if err != nil {
+				return fmt.Errorf("upsert doctor acknowledgement %s/%s: %w", entry.CheckID, entry.EvidenceFingerprint, err)
+			}
+			n, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("count upserted doctor acknowledgement %s/%s: %w", entry.CheckID, entry.EvidenceFingerprint, err)
+			}
+			written += n
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return written, nil
+}
+
+func normalizeDoctorAcknowledgementInputs(entries []DoctorAcknowledgementInput) []DoctorAcknowledgementInput {
+	seen := make(map[string]struct{}, len(entries))
+	out := make([]DoctorAcknowledgementInput, 0, len(entries))
+	for _, entry := range entries {
+		entry.CheckID = strings.TrimSpace(entry.CheckID)
+		entry.EvidenceFingerprint = strings.TrimSpace(entry.EvidenceFingerprint)
+		if entry.CheckID == "" || entry.EvidenceFingerprint == "" {
+			continue
+		}
+		key := entry.CheckID + "\x00" + entry.EvidenceFingerprint
+		if _, ok := seen[key]; ok {
+			// Last write wins, matching the upsert's own overwrite semantics.
+			for i := range out {
+				if out[i].CheckID == entry.CheckID && out[i].EvidenceFingerprint == entry.EvidenceFingerprint {
+					out[i] = entry
+					break
+				}
+			}
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// RevokeDoctorAcknowledgements deletes persisted acknowledgements for one
+// check code. An empty fingerprint slice revokes every acknowledgement for the
+// check; a non-empty slice revokes exactly those fingerprints. The returned
+// count is the number of rows deleted.
+func (s *Store) RevokeDoctorAcknowledgements(ctx context.Context, checkID string, fingerprints []string) (int64, error) {
+	_ = ctx
+	checkID = strings.TrimSpace(checkID)
+	if checkID == "" {
+		return 0, fmt.Errorf("revoke doctor acknowledgements: check id is required")
+	}
+	trimmed := make([]string, 0, len(fingerprints))
+	for _, fingerprint := range fingerprints {
+		if fingerprint = strings.TrimSpace(fingerprint); fingerprint != "" {
+			trimmed = append(trimmed, fingerprint)
+		}
+	}
+	if len(trimmed) == 0 {
+		result, err := s.execHook(s.db, `DELETE FROM doctor_acknowledgements WHERE check_id = ?`, checkID)
+		if err != nil {
+			return 0, fmt.Errorf("revoke doctor acknowledgements for %s: %w", checkID, err)
+		}
+		return result.RowsAffected()
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(trimmed)), ", ")
+	args := make([]any, 0, len(trimmed)+1)
+	args = append(args, checkID)
+	for _, fingerprint := range trimmed {
+		args = append(args, fingerprint)
+	}
+	result, err := s.execHook(s.db, `DELETE FROM doctor_acknowledgements WHERE check_id = ? AND evidence_fingerprint IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return 0, fmt.Errorf("revoke doctor acknowledgements for %s: %w", checkID, err)
+	}
+	return result.RowsAffected()
+}
+
+// PruneDoctorAcknowledgements deletes acknowledgements for one check whose
+// evidence fingerprint is NOT in seenFingerprints. The caller passes the
+// fingerprints of the findings a full doctor run just collected, so rows whose
+// evidence no longer exists are removed instead of accumulating forever. An
+// empty (or all-blank) seenFingerprints prunes every acknowledgement for the
+// check: the caller proved the check currently reports no evidence at all, so
+// no acknowledgement can still match. Callers that cannot prove absence — a
+// single-check or project-scoped run — must not call this method.
+func (s *Store) PruneDoctorAcknowledgements(ctx context.Context, checkID string, seenFingerprints []string) (int64, error) {
+	_ = ctx
+	checkID = strings.TrimSpace(checkID)
+	if checkID == "" {
+		return 0, fmt.Errorf("prune doctor acknowledgements: check id is required")
+	}
+	seen := make([]string, 0, len(seenFingerprints))
+	for _, fingerprint := range seenFingerprints {
+		if fingerprint = strings.TrimSpace(fingerprint); fingerprint != "" {
+			seen = append(seen, fingerprint)
+		}
+	}
+	var (
+		result sql.Result
+		err    error
+	)
+	if len(seen) == 0 {
+		result, err = s.execHook(s.db, `DELETE FROM doctor_acknowledgements WHERE check_id = ?`, checkID)
+	} else {
+		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(seen)), ", ")
+		args := make([]any, 0, len(seen)+1)
+		args = append(args, checkID)
+		for _, fingerprint := range seen {
+			args = append(args, fingerprint)
+		}
+		result, err = s.execHook(s.db, `DELETE FROM doctor_acknowledgements WHERE check_id = ? AND evidence_fingerprint NOT IN (`+placeholders+`)`, args...)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("prune doctor acknowledgements for %s: %w", checkID, err)
+	}
+	return result.RowsAffected()
+}
+
+// AcknowledgedFingerprints indexes the persisted acknowledgements for one
+// check by evidence fingerprint for the doctor report builder.
+func (s *Store) AcknowledgedFingerprints(ctx context.Context, checkID string) (map[string]DoctorAcknowledgement, error) {
+	acknowledgements, err := s.ListDoctorAcknowledgements(ctx, checkID)
+	if err != nil {
+		return nil, err
+	}
+	byFingerprint := make(map[string]DoctorAcknowledgement, len(acknowledgements))
+	for _, ack := range acknowledgements {
+		byFingerprint[ack.EvidenceFingerprint] = ack
+	}
+	return byFingerprint, nil
+}
+
 // SessionRebuildCandidate is one orphaned observation reference group that
 // doctor repair can heal by inserting a placeholder parent session.
 type SessionRebuildCandidate struct {

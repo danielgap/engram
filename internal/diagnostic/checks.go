@@ -39,6 +39,36 @@ const ReasonForeignSyncTarget = "foreign_sync_target"
 // session was deliberately deleted.
 const ReasonSessionDeleteTombstoned = "session_delete_tombstoned"
 
+// acknowledgeableChecks is the closed allowlist of checks whose findings a
+// human may acknowledge. Acknowledging is for diagnostic-only findings a human
+// has reviewed and accepted: the evidence cannot be acted on automatically and
+// doctor must stop re-reporting it on every run. Repairable checks are
+// deliberately excluded — their honest exit is the repair itself, not a
+// persisted silence, so an acknowledged row can never stand in for work the
+// repair path exists to do.
+var acknowledgeableChecks = map[string]struct{}{
+	CheckOrphanedObservationSession:     {},
+	CheckAmbiguousActiveRuntimeSessions: {},
+}
+
+// AcknowledgeableCodes returns the acknowledgeable check codes in a stable,
+// sorted order for command validation and help output.
+func AcknowledgeableCodes() []string {
+	codes := make([]string, 0, len(acknowledgeableChecks))
+	for code := range acknowledgeableChecks {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	return codes
+}
+
+// IsAcknowledgeableCode reports whether doctor findings of a check may be
+// acknowledged by a human.
+func IsAcknowledgeableCode(code string) bool {
+	_, ok := acknowledgeableChecks[strings.TrimSpace(code)]
+	return ok
+}
+
 type SessionProjectDirectoryMismatchCheck struct{}
 type ManualSessionNameProjectMismatchCheck struct{}
 type SyncMutationRequiredFieldsCheck struct{}

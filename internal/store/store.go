@@ -1644,6 +1644,28 @@ func (s *Store) migrate() error {
 		return err
 	}
 
+	// Phase 3c: persisted doctor acknowledgements. Each row records a human
+	// acceptance of one doctor finding, keyed by the check code and the sha256
+	// fingerprint of the finding's evidence, so the same acceptance survives
+	// unchanged across runs while a changed evidence value is a new,
+	// unacknowledged finding. Created with CREATE TABLE IF NOT EXISTS like the
+	// sync_apply_deferred table above: new databases get the table on first
+	// open and existing databases converge on their next open, with no
+	// destructive migration. Acknowledgements are local operator state: they
+	// journal no sync mutations and never alter the findings themselves.
+	if _, err := s.execHook(s.db, `
+		CREATE TABLE IF NOT EXISTS doctor_acknowledgements (
+			check_id             TEXT NOT NULL,
+			evidence_fingerprint TEXT NOT NULL,
+			note                 TEXT,
+			created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+			last_seen_at         TEXT NOT NULL DEFAULT (datetime('now')),
+			PRIMARY KEY (check_id, evidence_fingerprint)
+		);
+	`); err != nil {
+		return err
+	}
+
 	return nil
 }
 

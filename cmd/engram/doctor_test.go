@@ -1323,11 +1323,7 @@ func seedDoctorOrphanObservationAt(t *testing.T, cfg store.Config, syncID, sessi
 	if err != nil {
 		t.Fatalf("open database: %v", err)
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close database: %v", err)
-		}
-	}()
+	defer db.Close()
 	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
 		t.Fatalf("disable foreign keys: %v", err)
 	}
@@ -1433,11 +1429,7 @@ func TestCmdDoctorRepairOrphanedObservationSessionPlanDryRunApplyLifecycle(t *te
 	if err != nil {
 		t.Fatalf("reopen after apply: %v", err)
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close reopened database: %v", err)
-		}
-	}()
+	defer db.Close()
 	assertPlaceholder := func(sessionID, project, ownership, timestamp string) {
 		t.Helper()
 		var directory, startedAt, endedAt, gotOwnership, summary string
@@ -1525,5 +1517,330 @@ func TestCmdDoctorRepairOrphanedObservationSessionApplyFailurePreservesBackupPat
 	}
 	if !strings.Contains(stderr, "pre-repair backup preserved at ") {
 		t.Fatalf("stderr=%q, want the preserved backup path", stderr)
+	}
+}
+
+// seedDoctorOrphanedObservation inserts one observation whose session reference
+// is missing, so orphaned_observation_session reports exactly one finding.
+func seedDoctorOrphanedObservation(t *testing.T, cfg store.Config, syncID, sessionID, project string) {
+	t.Helper()
+	initDoctorStore(t, cfg)
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`
+		PRAGMA foreign_keys = OFF;
+		INSERT INTO observations
+			(sync_id, session_id, type, title, content, project, scope, normalized_hash, revision_count, duplicate_count, created_at, updated_at)
+		VALUES (?, ?, 'bugfix', 'orphan', 'content', ?, 'project', ?, 1, 1, datetime('now'), datetime('now'));
+	`, syncID, sessionID, project, syncID); err != nil {
+		t.Fatalf("seed orphaned observation: %v", err)
+	}
+}
+
+func openDoctorStore(t *testing.T, cfg store.Config) *store.Store {
+	t.Helper()
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func TestCmdDoctorAcknowledgePersistsFindings(t *testing.T) {
+	cfg := testConfig(t)
+	seedDoctorOrphanedObservation(t, cfg, "obs-orphan-ack", "missing-session", "engram")
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--check", "orphaned_observation_session", "--project", "engram", "--note", "accepted by human")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "acknowledged 1 finding(s) for orphaned_observation_session") {
+		t.Fatalf("stdout=%q, want the total acknowledgement line", stdout)
+	}
+	s := openDoctorStore(t, cfg)
+	acks, err := s.ListDoctorAcknowledgements(context.Background(), "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 1 || acks[0].Note != "accepted by human" {
+		t.Fatalf("acks=%+v, want one persisted acknowledgement with the note", acks)
+	}
+
+	// The acknowledged finding disappears from the doctor report, which now
+	// reports the check as ok with the acknowledged count.
+	withArgs(t, "engram", "doctor", "--json", "--project", "engram", "--check", "orphaned_observation_session")
+	stdout, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("doctor stderr=%q", stderr)
+	}
+	report := decodeDoctorReport(t, stdout)
+	check := report["checks"].([]any)[0].(map[string]any)
+	if report["status"] != "ok" || check["result"] != "ok" || check["acknowledged_count"] != float64(1) {
+		t.Fatalf("report=%v, want ok with acknowledged_count 1", report)
+	}
+	if _, hasFindings := check["findings"]; hasFindings {
+		t.Fatalf("check=%v, want acknowledged findings filtered out", check)
+	}
+
+	// Text output surfaces the accepted count line too.
+	withArgs(t, "engram", "doctor", "--project", "engram", "--check", "orphaned_observation_session")
+	stdout, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" || !strings.Contains(stdout, "acknowledged.") || !strings.Contains(stdout, "[ok] orphaned_observation_session") {
+		t.Fatalf("stdout=%q stderr=%q, want the acknowledged ok rendering", stdout, stderr)
+	}
+}
+
+func TestCmdDoctorAcknowledgeZeroFindingsExitsClean(t *testing.T) {
+	cfg := testConfig(t)
+	initDoctorStore(t, cfg)
+
+	oldExit := exitFunc
+	exited := false
+	exitFunc = func(code int) { exited = code != 0 }
+	t.Cleanup(func() { exitFunc = oldExit })
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--check", "orphaned_observation_session")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if exited || stderr != "" {
+		t.Fatalf("exited=%v stderr=%q, want a clean exit 0", exited, stderr)
+	}
+	if !strings.Contains(stdout, "nothing to acknowledge") {
+		t.Fatalf("stdout=%q, want the nothing-reported line", stdout)
+	}
+	s := openDoctorStore(t, cfg)
+	acks, err := s.ListDoctorAcknowledgements(context.Background(), "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks=%+v, want nothing acknowledged", acks)
+	}
+}
+
+func TestCmdDoctorAcknowledgeRejectsNonAcknowledgeableCode(t *testing.T) {
+	cfg := testConfig(t)
+	initDoctorStore(t, cfg)
+
+	oldExit := exitFunc
+	exited := false
+	exitFunc = func(code int) { exited = code != 0 }
+	t.Cleanup(func() { exitFunc = oldExit })
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--check", "sync_mutation_required_fields")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if !exited {
+		t.Fatalf("want a non-zero exit for a repairable check")
+	}
+	if !strings.Contains(stderr, "unsupported acknowledge check") || !strings.Contains(stderr, "orphaned_observation_session") || !strings.Contains(stderr, "ambiguous_active_runtime_sessions") {
+		t.Fatalf("stderr=%q stdout=%q, want the error to list the valid codes", stderr, stdout)
+	}
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--check", "unknown_check")
+	_, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
+	if !strings.Contains(stderr, "unsupported acknowledge check") {
+		t.Fatalf("stderr=%q, want the unknown check rejected", stderr)
+	}
+}
+
+func TestCmdDoctorAcknowledgeRequiresCheck(t *testing.T) {
+	cfg := testConfig(t)
+	oldExit := exitFunc
+	exited := false
+	exitFunc = func(code int) { exited = code != 0 }
+	t.Cleanup(func() { exitFunc = oldExit })
+
+	withArgs(t, "engram", "doctor", "acknowledge")
+	_, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if !exited || !strings.Contains(stderr, "--check is required") {
+		t.Fatalf("stderr=%q exited=%v, want --check required", stderr, exited)
+	}
+}
+
+func TestCmdDoctorAcknowledgeRejectsContradictoryFlags(t *testing.T) {
+	cfg := testConfig(t)
+	oldExit := exitFunc
+	exited := false
+	exitFunc = func(code int) { exited = code != 0 }
+	t.Cleanup(func() { exitFunc = oldExit })
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--check", "orphaned_observation_session", "--revoke", "--note", "nope")
+	_, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if !exited || !strings.Contains(stderr, "--note cannot be combined with --revoke") {
+		t.Fatalf("stderr=%q exited=%v, want the contradiction rejected", stderr, exited)
+	}
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--check", "orphaned_observation_session", "--fingerprint", "ab")
+	_, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
+	if !exited || !strings.Contains(stderr, "--fingerprint requires --revoke") {
+		t.Fatalf("stderr=%q exited=%v, want --fingerprint gated behind --revoke", stderr, exited)
+	}
+}
+
+func TestCmdDoctorAcknowledgeRevokeWithAndWithoutFingerprint(t *testing.T) {
+	cfg := testConfig(t)
+	s := openDoctorStore(t, cfg)
+	ctx := context.Background()
+	if _, err := s.UpsertDoctorAcknowledgements(ctx, []store.DoctorAcknowledgementInput{
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "aa"},
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "bb"},
+	}); err != nil {
+		t.Fatalf("seed acknowledgements: %v", err)
+	}
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--check", "orphaned_observation_session", "--revoke", "--fingerprint", "aa")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "revoked 1 acknowledgement(s) for orphaned_observation_session") {
+		t.Fatalf("stdout=%q, want the single revocation line", stdout)
+	}
+	acks, err := s.ListDoctorAcknowledgements(ctx, "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 1 || acks[0].EvidenceFingerprint != "bb" {
+		t.Fatalf("acks=%+v, want only bb to survive the targeted revoke", acks)
+	}
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--check", "orphaned_observation_session", "--revoke")
+	stdout, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "revoked 1 acknowledgement(s) for orphaned_observation_session") {
+		t.Fatalf("stdout=%q, want the remaining row revoked", stdout)
+	}
+	acks, err = s.ListDoctorAcknowledgements(ctx, "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks=%+v, want the check fully revoked", acks)
+	}
+}
+
+func TestCmdDoctorAcknowledgeJSONShapes(t *testing.T) {
+	cfg := testConfig(t)
+	seedDoctorOrphanedObservation(t, cfg, "obs-orphan-json", "missing-session-json", "engram")
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--json", "--check", "orphaned_observation_session", "--project", "engram", "--note", "json note")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+	var ackResult map[string]any
+	if err := json.Unmarshal([]byte(stdout), &ackResult); err != nil {
+		t.Fatalf("acknowledge json invalid: %v\n%s", err, stdout)
+	}
+	if ackResult["mode"] != "acknowledge" || ackResult["check"] != "orphaned_observation_session" || ackResult["project"] != "engram" || ackResult["count"] != float64(1) {
+		t.Fatalf("ackResult=%v", ackResult)
+	}
+	acknowledged := ackResult["acknowledged"].([]any)
+	entry := acknowledged[0].(map[string]any)
+	if fingerprint, ok := entry["fingerprint"].(string); !ok || len(fingerprint) != 64 {
+		t.Fatalf("entry=%v, want the full 64-character fingerprint", entry)
+	}
+
+	withArgs(t, "engram", "doctor", "acknowledge", "--json", "--check", "orphaned_observation_session", "--revoke")
+	stdout, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("revoke stderr=%q", stderr)
+	}
+	ackResult = nil
+	if err := json.Unmarshal([]byte(stdout), &ackResult); err != nil {
+		t.Fatalf("revoke json invalid: %v\n%s", err, stdout)
+	}
+	if ackResult["mode"] != "revoke" || ackResult["count"] != float64(1) {
+		t.Fatalf("revoke result=%v", ackResult)
+	}
+
+	// With the finding's evidence gone from the store, the scoped run reports
+	// nothing and the acknowledge path acknowledges nothing.
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM observations WHERE sync_id = 'obs-orphan-json'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("delete orphaned observation: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	withArgs(t, "engram", "doctor", "acknowledge", "--json", "--check", "orphaned_observation_session", "--project", "engram")
+	stdout, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("zero findings stderr=%q", stderr)
+	}
+	ackResult = nil
+	if err := json.Unmarshal([]byte(stdout), &ackResult); err != nil {
+		t.Fatalf("zero findings json invalid: %v\n%s", err, stdout)
+	}
+	if ackResult["mode"] != "acknowledge" || ackResult["count"] != float64(0) || ackResult["acknowledged"] != nil {
+		t.Fatalf("zero findings result=%v", ackResult)
+	}
+}
+
+func TestCmdDoctorFullRunReportsPrunedAcknowledgements(t *testing.T) {
+	cfg := testConfig(t)
+	s := openDoctorStore(t, cfg)
+	if _, err := s.UpsertDoctorAcknowledgements(context.Background(), []store.DoctorAcknowledgementInput{
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "0000000000000000000000000000000000000000000000000000000000000000"},
+	}); err != nil {
+		t.Fatalf("seed stale acknowledgement: %v", err)
+	}
+
+	withArgs(t, "engram", "doctor")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "acknowledged (1 pruned)") {
+		t.Fatalf("stdout=%q, want the pruned acknowledgements line", stdout)
+	}
+	acks, err := s.ListDoctorAcknowledgements(context.Background(), "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks=%+v, want the stale row pruned by the full run", acks)
+	}
+
+	if _, err := s.UpsertDoctorAcknowledgements(context.Background(), []store.DoctorAcknowledgementInput{
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "0000000000000000000000000000000000000000000000000000000000000000"},
+	}); err != nil {
+		t.Fatalf("re-seed stale acknowledgement: %v", err)
+	}
+	withArgs(t, "engram", "doctor", "--json")
+	stdout, stderr = captureOutput(t, func() { cmdDoctor(cfg) })
+	if stderr != "" {
+		t.Fatalf("json stderr=%q", stderr)
+	}
+	report := decodeDoctorReport(t, stdout)
+	if report["acknowledgements_pruned"] != float64(1) {
+		t.Fatalf("report=%v, want acknowledgements_pruned 1 in the json envelope", report)
+	}
+}
+
+func TestPrintDoctorUsageDocumentsAcknowledge(t *testing.T) {
+	withArgs(t, "engram", "doctor", "--help")
+	stdout, stderr := captureOutput(t, func() { cmdDoctor(testConfig(t)) })
+	if stderr != "" {
+		t.Fatalf("stderr=%q", stderr)
+	}
+	for _, want := range []string{
+		"       engram doctor acknowledge --check CODE [--project PROJECT] [--note NOTE]\n",
+		"       engram doctor acknowledge --check CODE --revoke [--fingerprint HEX]\n",
+		"acknowledgeable checks: ambiguous_active_runtime_sessions, orphaned_observation_session\n",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("usage missing %q\n%s", want, stdout)
+		}
 	}
 }

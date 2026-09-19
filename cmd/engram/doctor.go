@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,10 @@ import (
 func cmdDoctor(cfg store.Config) {
 	if len(os.Args) > 2 && os.Args[2] == "repair" {
 		cmdDoctorRepair(cfg)
+		return
+	}
+	if len(os.Args) > 2 && os.Args[2] == "acknowledge" {
+		cmdDoctorAcknowledge(cfg)
 		return
 	}
 	jsonOut := false
@@ -92,9 +97,12 @@ func printDoctorUsage() {
 	fmt.Fprintln(os.Stdout, "usage: engram doctor [--json] [--project PROJECT] [--check CODE]")
 	fmt.Fprintln(os.Stdout, "       engram doctor repair --project PROJECT --check CODE (--plan|--dry-run|--apply)")
 	fmt.Fprintln(os.Stdout, "       engram doctor repair [--project PROJECT] --check "+diagnostic.CheckSyncMutationRequiredFields+" [--plan|--dry-run|--apply] (default: --dry-run)")
+	fmt.Fprintln(os.Stdout, "       engram doctor acknowledge --check CODE [--project PROJECT] [--note NOTE]")
+	fmt.Fprintln(os.Stdout, "       engram doctor acknowledge --check CODE --revoke [--fingerprint HEX]")
 	_, _ = fmt.Fprintln(os.Stdout, "note: --project is required for every repair check except "+diagnostic.CheckSyncMutationRequiredFields+", where it optionally scopes title repair, supersession, quarantine, and source-title repair.")
 	fmt.Fprintln(os.Stdout, "checks: "+strings.Join(diagnostic.RegisteredCodes(), ", "))
 	_, _ = fmt.Fprintln(os.Stdout, "diagnostic-only checks with no repair: "+strings.Join(diagnosticOnlyCheckCodes(), ", "))
+	_, _ = fmt.Fprintln(os.Stdout, "acknowledgeable checks: "+strings.Join(diagnostic.AcknowledgeableCodes(), ", "))
 }
 
 func printDoctorRepairUsage() {
@@ -361,6 +369,224 @@ func failDoctorRepair(message string) {
 	exitFunc(1)
 }
 
+// doctorAcknowledgeJSONResult is the stable JSON envelope of `engram doctor
+// acknowledge`. The acknowledge mode lists every fingerprint it upserted; the
+// revoke mode reports the deleted row count.
+type doctorAcknowledgeJSONResult struct {
+	Check        string                       `json:"check"`
+	Project      string                       `json:"project,omitempty"`
+	Mode         string                       `json:"mode"`
+	Count        int64                        `json:"count"`
+	Fingerprint  string                       `json:"fingerprint,omitempty"`
+	Acknowledged []doctorAcknowledgeEntryJSON `json:"acknowledged,omitempty"`
+}
+
+type doctorAcknowledgeEntryJSON struct {
+	Fingerprint string `json:"fingerprint"`
+	Display     string `json:"display"`
+	Note        string `json:"note,omitempty"`
+}
+
+func cmdDoctorAcknowledge(cfg store.Config) {
+	project := ""
+	check := ""
+	note := ""
+	fingerprint := ""
+	revoke := false
+	jsonOut := false
+	for i := 3; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--project":
+			if i+1 >= len(os.Args) {
+				failDoctorAcknowledge("--project requires a value")
+				return
+			}
+			project = os.Args[i+1]
+			i++
+		case "--check":
+			if i+1 >= len(os.Args) {
+				failDoctorAcknowledge("--check requires a value")
+				return
+			}
+			check = os.Args[i+1]
+			i++
+		case "--note":
+			if i+1 >= len(os.Args) {
+				failDoctorAcknowledge("--note requires a value")
+				return
+			}
+			note = os.Args[i+1]
+			i++
+		case "--fingerprint":
+			if i+1 >= len(os.Args) {
+				failDoctorAcknowledge("--fingerprint requires a value")
+				return
+			}
+			fingerprint = os.Args[i+1]
+			i++
+		case "--revoke":
+			revoke = true
+		case "--json":
+			jsonOut = true
+		case "--help", "-h", "help":
+			printDoctorAcknowledgeUsage()
+			return
+		default:
+			failDoctorAcknowledge(fmt.Sprintf("unknown doctor acknowledge argument %q", os.Args[i]))
+			return
+		}
+	}
+	check = strings.TrimSpace(check)
+	if check == "" {
+		failDoctorAcknowledge("--check is required")
+		return
+	}
+	if !diagnostic.IsAcknowledgeableCode(check) {
+		failDoctorAcknowledge(fmt.Sprintf("unsupported acknowledge check %q; acknowledgeable checks: %s", check, strings.Join(diagnostic.AcknowledgeableCodes(), ", ")))
+		return
+	}
+	if revoke && strings.TrimSpace(note) != "" {
+		failDoctorAcknowledge("--note cannot be combined with --revoke")
+		return
+	}
+	if !revoke && strings.TrimSpace(fingerprint) != "" {
+		failDoctorAcknowledge("--fingerprint requires --revoke")
+		return
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+	ctx := context.Background()
+	if revoke {
+		revokeDoctorAcknowledgements(ctx, s, check, fingerprint, jsonOut)
+		return
+	}
+	project, _ = store.NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project != "" {
+		// Acknowledge can inspect a check on a pending-sync project before it
+		// has an observation bucket, matching the base doctor command.
+		project, err = resolveCLIProject(s, project, false)
+		if err != nil {
+			fatal(err)
+			return
+		}
+	}
+	// runDiagnostics routes a --check request through RunOne, which filters
+	// already-acknowledged findings and never prunes: acknowledging is a
+	// scoped, additive action and must not revoke anything.
+	report, err := runDiagnostics(ctx, s, project, check)
+	if err != nil {
+		failDoctorAcknowledge(err.Error())
+		return
+	}
+	var findings []diagnostic.Finding
+	for _, checkResult := range report.Checks {
+		if checkResult.CheckID == check {
+			findings = checkResult.Findings
+		}
+	}
+	if len(findings) == 0 {
+		if jsonOut {
+			writeDoctorAcknowledgeJSON(doctorAcknowledgeJSONResult{Check: check, Project: project, Mode: "acknowledge", Count: 0})
+			return
+		}
+		fmt.Printf("no %s findings reported; nothing to acknowledge\n", check)
+		return
+	}
+	entries := make([]store.DoctorAcknowledgementInput, 0, len(findings))
+	rendered := make([]doctorAcknowledgeEntryJSON, 0, len(findings))
+	for _, finding := range findings {
+		fingerprint := diagnostic.FindingFingerprint(finding)
+		entries = append(entries, store.DoctorAcknowledgementInput{CheckID: check, EvidenceFingerprint: fingerprint, Note: strings.TrimSpace(note)})
+		rendered = append(rendered, doctorAcknowledgeEntryJSON{Fingerprint: fingerprint, Display: doctorAcknowledgeFindingLabel(finding), Note: strings.TrimSpace(note)})
+	}
+	written, err := s.UpsertDoctorAcknowledgements(ctx, entries)
+	if err != nil {
+		failDoctorAcknowledge(err.Error())
+		return
+	}
+	if jsonOut {
+		writeDoctorAcknowledgeJSON(doctorAcknowledgeJSONResult{Check: check, Project: project, Mode: "acknowledge", Count: written, Acknowledged: rendered})
+		return
+	}
+	for _, entry := range rendered {
+		fmt.Printf("%s %s %s\n", check, doctorAcknowledgeShortFingerprint(entry.Fingerprint), entry.Display)
+	}
+	fmt.Printf("acknowledged %d finding(s) for %s\n", written, check)
+}
+
+func revokeDoctorAcknowledgements(ctx context.Context, s *store.Store, check, fingerprint string, jsonOut bool) {
+	var fingerprints []string
+	if fingerprint = strings.TrimSpace(fingerprint); fingerprint != "" {
+		fingerprints = []string{fingerprint}
+	}
+	revoked, err := s.RevokeDoctorAcknowledgements(ctx, check, fingerprints)
+	if err != nil {
+		failDoctorAcknowledge(err.Error())
+		return
+	}
+	if jsonOut {
+		writeDoctorAcknowledgeJSON(doctorAcknowledgeJSONResult{Check: check, Mode: "revoke", Count: revoked, Fingerprint: fingerprint})
+		return
+	}
+	fmt.Printf("revoked %d acknowledgement(s) for %s\n", revoked, check)
+}
+
+// doctorAcknowledgeFindingLabel renders the human-facing tail of an
+// acknowledgement line: the affected project when the evidence carries one,
+// otherwise the affected session ID, otherwise a short evidence snippet.
+func doctorAcknowledgeFindingLabel(finding diagnostic.Finding) string {
+	var evidence struct {
+		Project   string `json:"project"`
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(finding.Evidence, &evidence); err == nil {
+		if label := strings.TrimSpace(evidence.Project); label != "" {
+			return label
+		}
+		if label := strings.TrimSpace(evidence.SessionID); label != "" {
+			return label
+		}
+	}
+	return truncate(string(finding.Evidence), 24)
+}
+
+// doctorAcknowledgeShortFingerprint truncates a fingerprint for display only;
+// stored acknowledgements always keep the full hex value.
+func doctorAcknowledgeShortFingerprint(fingerprint string) string {
+	if len(fingerprint) <= 12 {
+		return fingerprint
+	}
+	return fingerprint[:12]
+}
+
+func printDoctorAcknowledgeUsage() {
+	fmt.Fprintln(os.Stdout, "usage: engram doctor acknowledge --check CODE [--project PROJECT] [--note NOTE]")
+	fmt.Fprintln(os.Stdout, "       engram doctor acknowledge --check CODE --revoke [--fingerprint HEX]")
+	_, _ = fmt.Fprintln(os.Stdout, "note: acknowledgements persist accepted findings so doctor stops re-reporting them; a full unscoped run prunes acknowledgements whose evidence no longer exists.")
+	_, _ = fmt.Fprintln(os.Stdout, "acknowledgeable checks: "+strings.Join(diagnostic.AcknowledgeableCodes(), ", "))
+}
+
+func failDoctorAcknowledge(message string) {
+	fmt.Fprintln(os.Stderr, "engram doctor acknowledge failed: "+message)
+	printDoctorAcknowledgeUsage()
+	exitFunc(1)
+}
+
+func writeDoctorAcknowledgeJSON(value doctorAcknowledgeJSONResult) {
+	out, err := jsonMarshalIndent(value, "", "  ")
+	if err != nil {
+		fatal(err)
+		return
+	}
+	fmt.Println(string(out))
+}
+
 func writeDoctorRepairJSON(value any) {
 	out, err := jsonMarshalIndent(value, "", "  ")
 	if err != nil {
@@ -384,7 +610,11 @@ func renderDoctorText(report diagnostic.Report) {
 	if report.Project != "" {
 		fmt.Printf("Project: %s\n", report.Project)
 	}
-	fmt.Printf("Checks: %d ok=%d warnings=%d blocked=%d errors=%d\n\n", report.Summary.Total, report.Summary.OK, report.Summary.Warnings, report.Summary.Blocked, report.Summary.Errors)
+	fmt.Printf("Checks: %d ok=%d warnings=%d blocked=%d errors=%d\n", report.Summary.Total, report.Summary.OK, report.Summary.Warnings, report.Summary.Blocked, report.Summary.Errors)
+	if report.AcknowledgementsPruned > 0 {
+		fmt.Printf("acknowledged (%d pruned)\n", report.AcknowledgementsPruned)
+	}
+	fmt.Printf("\n")
 	for _, check := range report.Checks {
 		fmt.Printf("[%s] %s — %s\n", check.Result, check.CheckID, check.Message)
 		if check.Why != "" {

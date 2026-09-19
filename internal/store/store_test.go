@@ -16865,3 +16865,217 @@ func TestOrphanedSessionRepairUnblocksDeferredPulledObservation(t *testing.T) {
 		t.Fatalf("replayed observation rows=%d, want 1 under the rebuilt parent", applied)
 	}
 }
+
+func TestStoreDoctorAcknowledgementUpsertListRoundtrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	acks, err := s.ListDoctorAcknowledgements(ctx, "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements on empty table: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks=%+v, want empty", acks)
+	}
+
+	written, err := s.UpsertDoctorAcknowledgements(ctx, []DoctorAcknowledgementInput{
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "aa", Note: "accepted orphan"},
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "bb"},
+		{CheckID: "ambiguous_active_runtime_sessions", EvidenceFingerprint: "cc", Note: "accepted ambiguity"},
+		// Blank identity fields are dropped rather than stored.
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "  "},
+		{CheckID: "  ", EvidenceFingerprint: "dd"},
+	})
+	if err != nil {
+		t.Fatalf("UpsertDoctorAcknowledgements: %v", err)
+	}
+	if written != 3 {
+		t.Fatalf("written=%d, want 3", written)
+	}
+
+	acks, err = s.ListDoctorAcknowledgements(ctx, "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 2 || acks[0].EvidenceFingerprint != "aa" || acks[1].EvidenceFingerprint != "bb" {
+		t.Fatalf("acks=%+v, want aa then bb in fingerprint order", acks)
+	}
+	if acks[0].CheckID != "orphaned_observation_session" || acks[0].Note != "accepted orphan" {
+		t.Fatalf("acks[0]=%+v, want stored note", acks[0])
+	}
+	if acks[1].Note != "" {
+		t.Fatalf("acks[1].Note=%q, want blank note read back as empty", acks[1].Note)
+	}
+	for _, ack := range acks {
+		if ack.CreatedAt == "" || ack.LastSeenAt == "" {
+			t.Fatalf("ack=%+v, want default timestamps", ack)
+		}
+	}
+
+	byFingerprint, err := s.AcknowledgedFingerprints(ctx, "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("AcknowledgedFingerprints: %v", err)
+	}
+	if len(byFingerprint) != 2 || byFingerprint["bb"].CheckID != "orphaned_observation_session" {
+		t.Fatalf("byFingerprint=%+v, want both fingerprints indexed", byFingerprint)
+	}
+}
+
+func TestStoreDoctorAcknowledgementUpsertIsIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.UpsertDoctorAcknowledgements(ctx, []DoctorAcknowledgementInput{
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "aa", Note: "first note"},
+	}); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE doctor_acknowledgements SET last_seen_at = '2000-01-01 00:00:00' WHERE evidence_fingerprint = 'aa'`); err != nil {
+		t.Fatalf("backdate last_seen_at: %v", err)
+	}
+	var createdBefore string
+	if err := s.DB().QueryRow(`SELECT created_at FROM doctor_acknowledgements WHERE evidence_fingerprint = 'aa'`).Scan(&createdBefore); err != nil {
+		t.Fatalf("read created_at: %v", err)
+	}
+
+	written, err := s.UpsertDoctorAcknowledgements(ctx, []DoctorAcknowledgementInput{
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "aa", Note: "second note"},
+	})
+	if err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	if written != 1 {
+		t.Fatalf("written=%d, want 1 updated row", written)
+	}
+	if rows := scalarInt(t, s, `SELECT COUNT(*) FROM doctor_acknowledgements WHERE check_id = 'orphaned_observation_session'`); rows != 1 {
+		t.Fatalf("rows=%d, want the upsert to stay a single row", rows)
+	}
+	acks, err := s.ListDoctorAcknowledgements(ctx, "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 1 || acks[0].Note != "second note" {
+		t.Fatalf("acks=%+v, want the note overwritten", acks)
+	}
+	if acks[0].LastSeenAt == "2000-01-01 00:00:00" {
+		t.Fatalf("last_seen_at=%q, want the upsert to refresh it", acks[0].LastSeenAt)
+	}
+	if acks[0].CreatedAt != createdBefore {
+		t.Fatalf("created_at=%q, want the original %q preserved by the upsert", acks[0].CreatedAt, createdBefore)
+	}
+}
+
+func TestStoreDoctorAcknowledgementRevoke(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.UpsertDoctorAcknowledgements(ctx, []DoctorAcknowledgementInput{
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "aa"},
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "bb"},
+		{CheckID: "ambiguous_active_runtime_sessions", EvidenceFingerprint: "cc"},
+	}); err != nil {
+		t.Fatalf("seed upsert: %v", err)
+	}
+
+	revoked, err := s.RevokeDoctorAcknowledgements(ctx, "orphaned_observation_session", []string{"aa"})
+	if err != nil {
+		t.Fatalf("revoke by fingerprint: %v", err)
+	}
+	if revoked != 1 {
+		t.Fatalf("revoked=%d, want 1", revoked)
+	}
+	acks, err := s.ListDoctorAcknowledgements(ctx, "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 1 || acks[0].EvidenceFingerprint != "bb" {
+		t.Fatalf("acks=%+v, want only bb to survive", acks)
+	}
+
+	revoked, err = s.RevokeDoctorAcknowledgements(ctx, "orphaned_observation_session", nil)
+	if err != nil {
+		t.Fatalf("revoke all: %v", err)
+	}
+	if revoked != 1 {
+		t.Fatalf("revoked=%d, want 1", revoked)
+	}
+	remaining, err := s.ListDoctorAcknowledgements(ctx, "ambiguous_active_runtime_sessions")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].EvidenceFingerprint != "cc" {
+		t.Fatalf("remaining=%+v, want the other check untouched", remaining)
+	}
+
+	revoked, err = s.RevokeDoctorAcknowledgements(ctx, "orphaned_observation_session", nil)
+	if err != nil {
+		t.Fatalf("revoke on empty check: %v", err)
+	}
+	if revoked != 0 {
+		t.Fatalf("revoked=%d, want 0", revoked)
+	}
+	if _, err := s.RevokeDoctorAcknowledgements(ctx, "  ", nil); err == nil {
+		t.Fatalf("revoke with blank check id, want error")
+	}
+}
+
+func TestStoreDoctorAcknowledgementPrune(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.UpsertDoctorAcknowledgements(ctx, []DoctorAcknowledgementInput{
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "aa"},
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "bb"},
+		{CheckID: "orphaned_observation_session", EvidenceFingerprint: "cc"},
+		{CheckID: "ambiguous_active_runtime_sessions", EvidenceFingerprint: "dd"},
+	}); err != nil {
+		t.Fatalf("seed upsert: %v", err)
+	}
+
+	pruned, err := s.PruneDoctorAcknowledgements(ctx, "orphaned_observation_session", []string{"aa", "bb"})
+	if err != nil {
+		t.Fatalf("prune with seen fingerprints: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned=%d, want the unseen cc row removed", pruned)
+	}
+	acks, err := s.ListDoctorAcknowledgements(ctx, "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 2 || acks[0].EvidenceFingerprint != "aa" || acks[1].EvidenceFingerprint != "bb" {
+		t.Fatalf("acks=%+v, want the seen rows kept", acks)
+	}
+	other, err := s.ListDoctorAcknowledgements(ctx, "ambiguous_active_runtime_sessions")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(other) != 1 {
+		t.Fatalf("other=%+v, want the other check untouched by the prune", other)
+	}
+
+	// An empty seen list prunes every acknowledgement for the check: the
+	// caller proved the check currently reports no evidence at all.
+	pruned, err = s.PruneDoctorAcknowledgements(ctx, "orphaned_observation_session", nil)
+	if err != nil {
+		t.Fatalf("prune with empty seen: %v", err)
+	}
+	if pruned != 2 {
+		t.Fatalf("pruned=%d, want the remaining aa and bb rows removed", pruned)
+	}
+	acks, err = s.ListDoctorAcknowledgements(ctx, "orphaned_observation_session")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks=%+v, want the check fully pruned", acks)
+	}
+	other, err = s.ListDoctorAcknowledgements(ctx, "ambiguous_active_runtime_sessions")
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(other) != 1 {
+		t.Fatalf("other=%+v, want the other check untouched", other)
+	}
+	if _, err := s.PruneDoctorAcknowledgements(ctx, "", []string{"aa"}); err == nil {
+		t.Fatalf("prune with blank check id, want error")
+	}
+}

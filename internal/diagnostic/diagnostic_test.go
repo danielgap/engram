@@ -2,7 +2,9 @@ package diagnostic
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -1316,5 +1318,239 @@ func TestBuildRepairPlanOrphanedObservationSessionGroupsAndSkipsTombstones(t *te
 	}
 	if plan.Status != "noop" || len(plan.SessionRebuilds) != 0 || len(plan.Skipped) != 0 {
 		t.Fatalf("empty plan=%+v, want noop", plan)
+	}
+}
+
+func TestFindingFingerprintIsStableAndEvidenceSensitive(t *testing.T) {
+	finding := Finding{Evidence: mustJSON(map[string]any{"project": "engram", "session_id": "s1"})}
+	if got := FindingFingerprint(finding); got != FindingFingerprint(finding) {
+		t.Fatalf("fingerprint changed across calls: %s", got)
+	}
+	if len(FindingFingerprint(finding)) != 64 {
+		t.Fatalf("fingerprint length=%d, want 64 hex characters", len(FindingFingerprint(finding)))
+	}
+	changed := Finding{Evidence: mustJSON(map[string]any{"project": "engram", "session_id": "s2"})}
+	if FindingFingerprint(finding) == FindingFingerprint(changed) {
+		t.Fatalf("different evidence must fingerprint differently")
+	}
+	formatted := Finding{Evidence: json.RawMessage(`{"project":"engram","session_id":"s1"}`)}
+	if FindingFingerprint(finding) != FindingFingerprint(formatted) {
+		t.Fatalf("fingerprints are taken over the canonical encoding of the Evidence value itself")
+	}
+	// Findings built through mustJSON always marshal map keys in sorted order,
+	// so literal construction order cannot change the fingerprint.
+	sum := sha256.Sum256([]byte(`{"project":"engram","session_id":"s1"}`))
+	if got := FindingFingerprint(formatted); got != hex.EncodeToString(sum[:]) {
+		t.Fatalf("fingerprint=%s, want sha256 hex over the marshaled evidence bytes", got)
+	}
+}
+
+func TestFindingFingerprintDeterministicForDoctorEvidenceShapes(t *testing.T) {
+	orphanEvidence := map[string]any{"project": "engram", "session_id": "missing-session", "observation_count": 3}
+	ambiguousEvidence := map[string]any{"project": "engram", "active_candidate_count": 2, "directories": []string{"/work/a", "/work/b"}, "session_ids": []string{"s1", "s2"}}
+	cases := []struct {
+		name     string
+		evidence map[string]any
+	}{
+		{name: "orphaned_observation_session evidence", evidence: orphanEvidence},
+		{name: "ambiguous_active_runtime_sessions evidence", evidence: ambiguousEvidence},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Encoding/json sorts map keys, so rebuilding the same evidence in a
+			// different literal order must not change the fingerprint.
+			reordered := make(map[string]any, len(tc.evidence))
+			for key, value := range tc.evidence {
+				reordered[key] = value
+			}
+			first := FindingFingerprint(Finding{Evidence: mustJSON(tc.evidence)})
+			second := FindingFingerprint(Finding{Evidence: mustJSON(reordered)})
+			if first != second {
+				t.Fatalf("fingerprints differ for equal evidence: %s vs %s", first, second)
+			}
+			if first == FindingFingerprint(Finding{Evidence: mustJSON(map[string]any{"evaluated": true})}) {
+				t.Fatalf("fingerprint collided with the ok evidence placeholder")
+			}
+		})
+	}
+}
+
+// fakeAcknowledgeableCheck reports fixed findings under an acknowledgeable
+// check code so report filtering can be exercised against a real store.
+type fakeAcknowledgeableCheck struct {
+	findings []Finding
+}
+
+func (fakeAcknowledgeableCheck) Code() string { return CheckOrphanedObservationSession }
+func (c fakeAcknowledgeableCheck) Run(context.Context, Scope) (CheckResult, error) {
+	return resultFromFindings(c.Code(), map[string]any{"evaluated": true}, c.findings), nil
+}
+
+func fakeAcknowledgeableFinding(reason, sessionID string) Finding {
+	return Finding{
+		CheckID:              CheckOrphanedObservationSession,
+		Severity:             SeverityWarning,
+		ReasonCode:           reason,
+		Message:              "finding " + sessionID,
+		Why:                  "test",
+		Evidence:             mustJSON(map[string]any{"project": "engram", "session_id": sessionID}),
+		SafeNextStep:         "none",
+		RequiresConfirmation: true,
+	}
+}
+
+func TestReportFilteringAcknowledgedFindingsExcludedFromSeverity(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	ctx := context.Background()
+	first := fakeAcknowledgeableFinding("orphan_a", "orphan-a")
+	second := fakeAcknowledgeableFinding("orphan_b", "orphan-b")
+	runner := NewRunnerWithRegistry(NewRegistry(fakeAcknowledgeableCheck{findings: []Finding{first, second}}))
+	scope := Scope{Store: s, Project: "engram", Now: time.Now()}
+
+	// Mixed: one acknowledged finding plus one active finding. Severity comes
+	// from the active finding only, with the acknowledged count reported.
+	if _, err := s.UpsertDoctorAcknowledgements(ctx, []store.DoctorAcknowledgementInput{
+		{CheckID: CheckOrphanedObservationSession, EvidenceFingerprint: FindingFingerprint(first)},
+	}); err != nil {
+		t.Fatalf("seed acknowledgement: %v", err)
+	}
+	report, err := runner.RunOne(ctx, scope, CheckOrphanedObservationSession)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	check := report.Checks[0]
+	if check.Result != StatusWarning || check.Severity != SeverityWarning {
+		t.Fatalf("result=%s severity=%s, want warning from the active finding alone", check.Result, check.Severity)
+	}
+	if check.AcknowledgedCount != 1 || len(check.Findings) != 1 || check.Findings[0].ReasonCode != "orphan_b" {
+		t.Fatalf("acknowledged_count=%d findings=%+v, want one active finding left", check.AcknowledgedCount, check.Findings)
+	}
+
+	// All acknowledged: the check reports ok with the acknowledged count set.
+	if _, err := s.UpsertDoctorAcknowledgements(ctx, []store.DoctorAcknowledgementInput{
+		{CheckID: CheckOrphanedObservationSession, EvidenceFingerprint: FindingFingerprint(second)},
+	}); err != nil {
+		t.Fatalf("seed second acknowledgement: %v", err)
+	}
+	report, err = runner.RunOne(ctx, scope, CheckOrphanedObservationSession)
+	if err != nil {
+		t.Fatalf("RunOne all acknowledged: %v", err)
+	}
+	check = report.Checks[0]
+	if report.Status != StatusOK || check.Result != StatusOK || check.Severity != SeverityInfo {
+		t.Fatalf("status=%s result=%s severity=%s, want ok when every finding is acknowledged", report.Status, check.Result, check.Severity)
+	}
+	if check.AcknowledgedCount != 2 || len(check.Findings) != 0 || check.ReasonCode != CheckOrphanedObservationSession+"_ok" {
+		t.Fatalf("acknowledged_count=%d findings=%d reason=%s, want ok shape with count 2", check.AcknowledgedCount, len(check.Findings), check.ReasonCode)
+	}
+}
+
+func TestReportFilteringUnchangedShapeWithoutAcknowledgements(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	runner := NewRunnerWithRegistry(NewRegistry(fakeAcknowledgeableCheck{findings: []Finding{fakeAcknowledgeableFinding("orphan_a", "orphan-a")}}))
+	report, err := runner.RunOne(context.Background(), Scope{Store: s, Project: "engram", Now: time.Now()}, CheckOrphanedObservationSession)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	check := report.Checks[0]
+	if check.AcknowledgedCount != 0 || len(check.Findings) != 1 || report.AcknowledgementsPruned != 0 {
+		t.Fatalf("check=%+v, want the unacknowledged shape unchanged", check)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	if strings.Contains(string(encoded), "acknowledged_count") || strings.Contains(string(encoded), "acknowledgements_pruned") {
+		t.Fatalf("json=%s, want omitempty to hide empty acknowledgement fields", encoded)
+	}
+}
+
+func TestReportFilteringIgnoresNonAcknowledgeableChecks(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	ctx := context.Background()
+	blocked := Finding{CheckID: "fake_blocked", Severity: SeverityBlocking, ReasonCode: "fake_blocked_reason", Message: "blocked", Why: "test", Evidence: mustJSON(map[string]any{"session_id": "s1"}), SafeNextStep: "none"}
+	if _, err := s.UpsertDoctorAcknowledgements(ctx, []store.DoctorAcknowledgementInput{
+		{CheckID: "fake_blocked", EvidenceFingerprint: FindingFingerprint(blocked)},
+	}); err != nil {
+		t.Fatalf("seed acknowledgement for a non-acknowledgeable check: %v", err)
+	}
+	report, err := NewRunnerWithRegistry(NewRegistry(fakeBlockedCheck{})).RunOne(ctx, Scope{Store: s, Project: "engram", Now: time.Now()}, "fake_blocked")
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if len(report.Checks[0].Findings) != 1 || report.Checks[0].AcknowledgedCount != 0 {
+		t.Fatalf("check=%+v, want the non-acknowledgeable finding reported unfiltered", report.Checks[0])
+	}
+}
+
+func TestRunAllPrunesStaleAcknowledgementsButRunOneDoesNot(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	ctx := context.Background()
+	live := fakeAcknowledgeableFinding("orphan_a", "orphan-a")
+	stale := "0000000000000000000000000000000000000000000000000000000000000000"
+	if _, err := s.UpsertDoctorAcknowledgements(ctx, []store.DoctorAcknowledgementInput{
+		{CheckID: CheckOrphanedObservationSession, EvidenceFingerprint: FindingFingerprint(live)},
+		{CheckID: CheckOrphanedObservationSession, EvidenceFingerprint: stale},
+	}); err != nil {
+		t.Fatalf("seed acknowledgements: %v", err)
+	}
+	runner := NewRunnerWithRegistry(NewRegistry(fakeAcknowledgeableCheck{findings: []Finding{live}}))
+	scope := Scope{Store: s, Project: "engram", Now: time.Now()}
+
+	// RunOne never prunes: a scoped run does not prove absence.
+	if _, err := runner.RunOne(ctx, scope, CheckOrphanedObservationSession); err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	acks, err := s.ListDoctorAcknowledgements(ctx, CheckOrphanedObservationSession)
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements after RunOne: %v", err)
+	}
+	if len(acks) != 2 {
+		t.Fatalf("acks=%+v, want RunOne to keep every acknowledgement", acks)
+	}
+
+	// RunAll prunes the acknowledgement whose evidence no longer exists and
+	// keeps the one whose evidence the run still saw.
+	report, err := runner.RunAll(ctx, scope)
+	if err != nil {
+		t.Fatalf("RunAll: %v", err)
+	}
+	if report.AcknowledgementsPruned != 1 {
+		t.Fatalf("acknowledgements_pruned=%d, want 1", report.AcknowledgementsPruned)
+	}
+	acks, err = s.ListDoctorAcknowledgements(ctx, CheckOrphanedObservationSession)
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements after RunAll: %v", err)
+	}
+	if len(acks) != 1 || acks[0].EvidenceFingerprint != FindingFingerprint(live) {
+		t.Fatalf("acks=%+v, want only the live acknowledgement to survive", acks)
+	}
+	if report.Checks[0].AcknowledgedCount != 1 {
+		t.Fatalf("acknowledged_count=%d, want the live acknowledgement to filter its finding", report.Checks[0].AcknowledgedCount)
+	}
+}
+
+func TestRunAllPrunesEveryAcknowledgementWhenCheckReportsNothing(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	ctx := context.Background()
+	if _, err := s.UpsertDoctorAcknowledgements(ctx, []store.DoctorAcknowledgementInput{
+		{CheckID: CheckOrphanedObservationSession, EvidenceFingerprint: "0000000000000000000000000000000000000000000000000000000000000000"},
+	}); err != nil {
+		t.Fatalf("seed stale acknowledgement: %v", err)
+	}
+	runner := NewRunnerWithRegistry(NewRegistry(fakeAcknowledgeableCheck{}))
+	report, err := runner.RunAll(ctx, Scope{Store: s, Project: "engram", Now: time.Now()})
+	if err != nil {
+		t.Fatalf("RunAll: %v", err)
+	}
+	if report.AcknowledgementsPruned != 1 {
+		t.Fatalf("acknowledgements_pruned=%d, want the stale row pruned when the check reports nothing", report.AcknowledgementsPruned)
+	}
+	acks, err := s.ListDoctorAcknowledgements(ctx, CheckOrphanedObservationSession)
+	if err != nil {
+		t.Fatalf("ListDoctorAcknowledgements: %v", err)
+	}
+	if len(acks) != 0 {
+		t.Fatalf("acks=%+v, want the empty seen run to prune all rows for the check", acks)
 	}
 }
