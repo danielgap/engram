@@ -61,11 +61,11 @@ var (
 	storeApplyPulledChunk = func(s *store.Store, targetKey, chunkID string, mutations []store.SyncMutation, cloud bool) error {
 		return s.ApplyPulledChunkForDomain(targetKey, chunkID, mutations, cloud)
 	}
+	storeApplyPulledChunkWithDeferredRelations = func(s *store.Store, targetKey, chunkID string, mutations, deferredRelations []store.SyncMutation, cloud bool) error {
+		return s.ApplyPulledChunkWithDeferredRelationsForDomain(targetKey, chunkID, mutations, deferredRelations, cloud)
+	}
 	storeRecordSynced = func(s *store.Store, targetKey, chunkID string) error {
 		return s.RecordSyncedChunkForTarget(targetKey, chunkID)
-	}
-	storeEnqueueDeferredRelation = func(s *store.Store, targetKey string, mutation store.SyncMutation) error {
-		return s.EnqueueDeferredRelation(targetKey, mutation)
 	}
 )
 
@@ -1051,28 +1051,18 @@ func (sy *Syncer) importEntriesDependencySafeWithProgress(entries []ChunkEntry, 
 				}
 			}
 
-			// An edge dropped here must survive a crash as replayable state, so
-			// every skipped relation is durably queued BEFORE the filtered chunk
-			// can apply and be marked synced. An enqueue error aborts before any
-			// chunk mutation, so the edge is never lost silently; the existing
-			// deferred replay heals the row once the endpoint reappears.
-			if len(skippedMutations) > 0 {
-				targetKey := sy.chunkTrackingTargetKey("")
-				for _, skipped := range skippedMutations {
-					if err := storeEnqueueDeferredRelation(sy.store, targetKey, skipped); err != nil {
-						return nil, fmt.Errorf("defer skipped relation %s: %w", strings.TrimSpace(skipped.EntityKey), err)
-					}
-				}
-			}
-
-			if err := sy.importMutationChunk(entry.ID, applyChunk, mode == importModeCloud); err != nil {
+			// Store owns the atomic boundary for a filtered cloud chunk: it applies
+			// the filtered mutations, queues skipped relations, and marks the chunk
+			// synced in one transaction. Its authoritative cloud validation runs
+			// inside that boundary, so a rejected chunk cannot leave a replay row.
+			if err := sy.importMutationChunk(entry.ID, applyChunk, skippedMutations, mode == importModeCloud); err != nil {
 				if mode == importModeLocal {
 					recoveredChunk, recovered, recoveryErr := sy.recoverLocalMissingSessionDependencies(chunk, availableSessionIDs)
 					if recoveryErr != nil {
 						return nil, recoveryErr
 					}
 					if recovered {
-						if retryErr := sy.importMutationChunk(entry.ID, recoveredChunk, mode == importModeCloud); retryErr == nil {
+						if retryErr := sy.importMutationChunk(entry.ID, recoveredChunk, nil, mode == importModeCloud); retryErr == nil {
 							chunk = recoveredChunk
 							goto imported
 						} else {
@@ -1150,10 +1140,14 @@ func (sy *Syncer) preflightLegacyChunkOwnership(entries []ChunkEntry, mode impor
 // cloud mode selected in ImportWithProgress) instead of being inferred from the
 // chunk-tracking target key: cloud chunks must meet the strict cloud directory
 // admission, while local chunks keep the #1287 blank-directory acceptance.
-func (sy *Syncer) importMutationChunk(chunkID string, chunk ChunkData, cloud bool) error {
+func (sy *Syncer) importMutationChunk(chunkID string, chunk ChunkData, deferredRelations []store.SyncMutation, cloud bool) error {
 	mutations := buildImportMutations(chunk)
 	mutations = orderMutationsForApply(mutations)
-	return storeApplyPulledChunk(sy.store, sy.chunkTrackingTargetKey(""), chunkID, mutations, cloud)
+	targetKey := sy.chunkTrackingTargetKey("")
+	if len(deferredRelations) > 0 {
+		return storeApplyPulledChunkWithDeferredRelations(sy.store, targetKey, chunkID, mutations, deferredRelations, cloud)
+	}
+	return storeApplyPulledChunk(sy.store, targetKey, chunkID, mutations, cloud)
 }
 
 // ─── Issue #1135: permanently unsatisfiable relation upserts ─────────────────

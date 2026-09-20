@@ -6910,6 +6910,24 @@ func (s *Store) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMuta
 // blank directories are accepted and the skip-plus-evidence quarantine ladder
 // behaves exactly as before.
 func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations []SyncMutation, cloud bool) error {
+	return s.applyPulledChunkForDomain(targetKey, chunkID, mutations, nil, cloud)
+}
+
+// ApplyPulledChunkWithDeferredRelationsForDomain applies a pulled chunk and
+// queues its skipped relation upserts in one transaction. Cloud import uses
+// this when #1135 filtering removes relations whose endpoints are permanently
+// unsatisfiable, so strict chunk validation cannot leave a replay row behind
+// after rejecting the chunk.
+func (s *Store) ApplyPulledChunkWithDeferredRelationsForDomain(targetKey, chunkID string, mutations, deferredRelations []SyncMutation, cloud bool) error {
+	return s.applyPulledChunkForDomain(targetKey, chunkID, mutations, deferredRelations, cloud)
+}
+
+func (s *Store) applyPulledChunkForDomain(targetKey, chunkID string, mutations, deferredRelations []SyncMutation, cloud bool) error {
+	for _, mutation := range deferredRelations {
+		if mutation.Entity != SyncEntityRelation {
+			return fmt.Errorf("ApplyPulledChunkWithDeferredRelationsForDomain: unsupported deferred entity %q", mutation.Entity)
+		}
+	}
 	targetKey = normalizeSyncTargetKey(targetKey)
 	chunkTargetKey := normalizeChunkTargetKey(targetKey)
 	chunkID = strings.TrimSpace(chunkID)
@@ -6958,6 +6976,14 @@ func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations [
 					}
 				}
 			}
+		}
+
+		for _, mutation := range deferredRelations {
+			syncID, err := s.writeRelationApplyFailureTx(tx, targetKey, mutation, "deferred", true)
+			if err != nil {
+				return fmt.Errorf("queue deferred relation %s: %w", mutation.EntityKey, err)
+			}
+			log.Printf("[store] ApplyPulledChunkWithDeferredRelationsForDomain entity_key=%s sync_id=%s - queued with applied chunk (issue #1135)", mutation.EntityKey, syncID)
 		}
 
 		if _, err := s.execHook(tx,

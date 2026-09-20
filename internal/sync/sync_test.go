@@ -5497,6 +5497,59 @@ func TestCloudImportDoesNotSkipRelationWithTombstonedEndpoint(t *testing.T) {
 	}
 }
 
+// TestCloudImportRejectedFilteredChunkDoesNotQueueSkippedRelation verifies that
+// #1135 skipped relations commit only with a successfully applied cloud chunk.
+func TestCloudImportRejectedFilteredChunkDoesNotQueueSkippedRelation(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		sessionPayload string
+	}{
+		{
+			name:           "blank directory",
+			sessionPayload: `{"id":"sess-atomic-skip","project":"proj-a","directory":""}`,
+		},
+		{
+			name:           "missing directory",
+			sessionPayload: `{"id":"sess-atomic-skip","project":"proj-a"}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.EnrollProject("proj-a"); err != nil {
+				t.Fatalf("enroll project: %v", err)
+			}
+			chunkID := "chunk-atomic-skip-" + strings.ReplaceAll(tt.name, " ", "-")
+			chunk := withObservationDelete(relationMissingEndpointChunk("sess-atomic-skip", "obs-atomic-skip-src", "obs-atomic-skip-gone", "rel-atomic-skip"), "obs-atomic-skip-gone")
+			chunk.Mutations[0].Payload = tt.sessionPayload
+			transport := newFakeCloudTransport()
+			transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2026-08-27T03:00:00Z"}}}
+			transport.chunks[chunkID] = mustJSONChunk(t, chunkID, chunk)
+
+			_, err := NewCloudWithTransport(s, transport, "proj-a").Import()
+			if err == nil {
+				t.Fatal("expected cloud import to fail strict session directory validation")
+			}
+			synced, err := s.GetSyncedChunksForTarget(cloudTargetKey("proj-a"))
+			if err != nil {
+				t.Fatalf("get synced chunks: %v", err)
+			}
+			if synced[chunkID] {
+				t.Fatalf("rejected chunk %q must not be marked synced", chunkID)
+			}
+			if _, err := s.GetSession("sess-atomic-skip"); err == nil {
+				t.Fatal("rejected chunk session must not persist")
+			}
+			deferred, dead, err := s.CountDeferredAndDead()
+			if err != nil {
+				t.Fatalf("count deferred and dead: %v", err)
+			}
+			if deferred != 0 || dead != 0 {
+				t.Fatalf("rejected chunk must not queue skipped relations: deferred=%d dead=%d", deferred, dead)
+			}
+		})
+	}
+}
+
 // TestCloudImportStallPathSurvivesRelationFiltering pins design point 3: a
 // chunk whose filtered remainder still fails for an unrelated reason keeps the
 // original stall semantics instead of appearing fixed while data is lost.
@@ -5664,10 +5717,9 @@ func TestCloudImportSkippedRelationHealsWhenEndpointReappears(t *testing.T) {
 	}
 }
 
-// TestCloudImportAbortsWhenDeferredEnqueueFails pins the ordering guarantee of
-// the skip queue: enqueueing a skipped edge happens BEFORE the filtered chunk
-// can apply or be marked synced, so an enqueue error aborts the import with no
-// chunk mutation and no synced marker — the edge is never lost silently.
+// TestCloudImportAbortsWhenDeferredEnqueueFails pins the atomic skip-queue
+// boundary: a queue error aborts the entire filtered chunk, leaving no chunk
+// mutation or synced marker so the edge is never lost silently.
 func TestCloudImportAbortsWhenDeferredEnqueueFails(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.EnrollProject("proj-a"); err != nil {
@@ -5680,11 +5732,11 @@ func TestCloudImportAbortsWhenDeferredEnqueueFails(t *testing.T) {
 		relationMissingEndpointChunk("sess-enq-fail", "obs-enq-fail-src", "obs-enq-fail-gone", "rel-enq-fail"), "obs-enq-fail-gone"))
 	importer := NewCloudWithTransport(s, transport, "proj-a")
 
-	orig := storeEnqueueDeferredRelation
-	storeEnqueueDeferredRelation = func(*store.Store, string, store.SyncMutation) error {
+	orig := storeApplyPulledChunkWithDeferredRelations
+	storeApplyPulledChunkWithDeferredRelations = func(*store.Store, string, string, []store.SyncMutation, []store.SyncMutation, bool) error {
 		return fmt.Errorf("enqueue offline")
 	}
-	defer func() { storeEnqueueDeferredRelation = orig }()
+	defer func() { storeApplyPulledChunkWithDeferredRelations = orig }()
 
 	_, err := importer.Import()
 	if err == nil || !strings.Contains(err.Error(), "enqueue offline") {
