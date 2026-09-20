@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Gentleman-Programming/engram/v2/internal/store"
 )
@@ -19,16 +22,60 @@ var (
 	storeGetSession = func(s *store.Store, id string) (*store.Session, error) {
 		return s.GetSession(id)
 	}
+	storeStaleOpenSessions = func(s *store.Store, now time.Time, olderThan time.Duration, project string) ([]store.StaleOpenSession, error) {
+		return s.StaleOpenSessions(now, olderThan, project)
+	}
+	storeEndSessionsBulk = func(s *store.Store, now time.Time, olderThan time.Duration, project string) ([]string, error) {
+		return s.EndSessionsBulk(now, olderThan, project)
+	}
 )
 
 // sessionEndArgs carries the parsed form of one "engram session end"
-// invocation. This slice only supports the single-session grammar; bulk
-// filters (--by-age/--project/--apply) land in a later slice.
+// invocation. A nonempty sessionID selects single mode; an empty sessionID
+// selects bulk mode driven by the staleness filters.
 type sessionEndArgs struct {
 	sessionID  string
 	summary    string
 	hasSummary bool
+	olderThan  time.Duration
+	hasByAge   bool
+	project    string
+	apply      bool
 	jsonOut    bool
+}
+
+// bulk reports whether the invocation targets the bulk (filter-driven) mode.
+func (a sessionEndArgs) bulk() bool { return a.sessionID == "" }
+
+// compactAgePattern matches the compact day/week duration forms ("30d", "2w")
+// accepted alongside Go duration syntax.
+var compactAgePattern = regexp.MustCompile(`^(\d+(?:\.\d+)?)([dw])$`)
+
+// parseSessionEndAge accepts Go duration syntax ("72h", "45m") plus the
+// compact day/week forms ("30d", "2w") the CLI documents for staleness
+// windows. d=24h, w=7d. Zero and negative windows are rejected: they select
+// nothing sensible and almost always signal a typo.
+func parseSessionEndAge(value string) (time.Duration, error) {
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		matches := compactAgePattern.FindStringSubmatch(value)
+		if matches == nil {
+			return 0, fmt.Errorf("invalid duration %q (use Go syntax like 72h or compact 30d/2w)", value)
+		}
+		n, parseErr := strconv.ParseFloat(matches[1], 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("invalid duration %q: %w", value, parseErr)
+		}
+		unit := 24 * time.Hour
+		if matches[2] == "w" {
+			unit = 7 * 24 * time.Hour
+		}
+		d = time.Duration(n * float64(unit))
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid duration %q: must be positive", value)
+	}
+	return d, nil
 }
 
 // isMissingFlagValue reports whether the token after a value-taking flag fails
@@ -42,10 +89,13 @@ func isMissingFlagValue(value string) bool {
 
 // parseSessionEndArgs validates the tokens that follow "engram session end"
 // and rejects anything undocumented BEFORE the store is opened (#1084
-// guarantee): silently ignoring an unsupported option would let an end
-// operation run under assumptions the operator never made. Flag values are
-// held to the same bar, so a value that looks like the next flag
-// (--summary --json) errors instead of being swallowed.
+// guarantee): silently ignoring an unsupported option such as --apply would
+// let an end operation run under assumptions the operator never made. Flag
+// values are held to the same bar, so a value that looks like the next flag
+// (--summary --apply) errors instead of being swallowed. Bulk mode (no session
+// ID) requires an explicit --by-age window: without one the staleness cutoff
+// degenerates to "now" and an --apply run would end every live open session,
+// while --project alone only narrows the match within a window.
 func parseSessionEndArgs(args []string) (sessionEndArgs, error) {
 	var parsed sessionEndArgs
 	for i := 0; i < len(args); i++ {
@@ -57,6 +107,25 @@ func parseSessionEndArgs(args []string) (sessionEndArgs, error) {
 			parsed.summary = args[i+1]
 			parsed.hasSummary = true
 			i++
+		case "--by-age":
+			if i+1 >= len(args) {
+				return sessionEndArgs{}, errors.New("--by-age requires a value")
+			}
+			d, err := parseSessionEndAge(args[i+1])
+			if err != nil {
+				return sessionEndArgs{}, fmt.Errorf("invalid --by-age value: %w", err)
+			}
+			parsed.olderThan = d
+			parsed.hasByAge = true
+			i++
+		case "--project":
+			if i+1 >= len(args) || isMissingFlagValue(args[i+1]) {
+				return sessionEndArgs{}, errors.New("--project requires a value")
+			}
+			parsed.project = args[i+1]
+			i++
+		case "--apply":
+			parsed.apply = true
 		case "--json":
 			parsed.jsonOut = true
 		default:
@@ -69,19 +138,45 @@ func parseSessionEndArgs(args []string) (sessionEndArgs, error) {
 			parsed.sessionID = args[i]
 		}
 	}
-	if parsed.sessionID == "" {
-		return sessionEndArgs{}, errors.New("a session ID is required")
+
+	if parsed.sessionID != "" {
+		if parsed.hasByAge || parsed.project != "" {
+			return sessionEndArgs{}, errors.New("a session ID and the bulk filters (--by-age/--project) are mutually exclusive")
+		}
+		if parsed.apply {
+			return sessionEndArgs{}, errors.New("--apply is only valid with bulk filters")
+		}
+		return parsed, nil
+	}
+	if parsed.hasSummary {
+		return sessionEndArgs{}, errors.New("--summary is only valid when ending a single session by ID")
+	}
+	// A staleness window is the bulk-mode seatbelt: the store query treats a
+	// zero window as "everything open up to now", so ending by project name
+	// alone would sweep live sessions into the batch.
+	if !parsed.hasByAge {
+		if parsed.project != "" {
+			return sessionEndArgs{}, errors.New("bulk mode requires --by-age DURATION (--project only narrows within that window)")
+		}
+		return sessionEndArgs{}, errors.New("specify a session ID, or an explicit staleness window (--by-age) for bulk mode")
 	}
 	return parsed, nil
 }
 
 func printSessionEndUsage() {
 	fmt.Fprintln(os.Stderr, "usage: engram session end <id> [--summary TEXT] [--json]")
+	fmt.Fprintln(os.Stderr, "       engram session end --by-age DURATION [--project NAME] [--apply] [--json]")
+	fmt.Fprintln(os.Stderr, "  End one session by ID (immediate, idempotent: an already-ended session is a no-op notice),")
+	fmt.Fprintln(os.Stderr, "  or bulk-end stale open sessions older than the --by-age window (required in bulk mode).")
+	fmt.Fprintln(os.Stderr, "  --project only narrows the bulk match within that window.")
+	fmt.Fprintln(os.Stderr, "  Bulk runs a DRY-RUN preview by default; add --apply to end the matched sessions.")
+	fmt.Fprintln(os.Stderr, "  DURATION accepts Go syntax (72h) or compact forms (30d, 2w).")
 }
 
 func cmdSession(cfg store.Config) {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: engram session end <id> [--summary TEXT] [--json]")
+		fmt.Fprintln(os.Stderr, "       engram session end --by-age DURATION [--project NAME] [--apply] [--json]")
 		exitFunc(1)
 		return
 	}
@@ -104,6 +199,10 @@ func cmdSessionEnd(cfg store.Config) {
 		exitFunc(1)
 		return
 	}
+	if parsed.bulk() {
+		cmdSessionEndBulk(cfg, parsed)
+		return
+	}
 	cmdSessionEndSingle(cfg, parsed)
 }
 
@@ -116,19 +215,20 @@ const (
 	sessionEndStatusAlreadyEnded = "already_ended"
 )
 
-// sessionEndJSON is the --json payload of one session end run. EndedAt always
-// carries a store-read timestamp: the original ended_at for an already-ended
-// session, the authoritative new value after a committed end. It is omitted
-// only if the store somehow reports none, so a committed end can still lose
-// the field to a failed read without corrupting the payload.
+// sessionEndJSON is the --json payload of one single-session end run. EndedAt
+// always carries a store-read timestamp: the original ended_at for an
+// already-ended session, the authoritative new value after a committed end.
+// It is omitted only if the store somehow reports none, so a committed end
+// can still lose the field to a failed read without corrupting the payload.
 type sessionEndJSON struct {
 	ID      string  `json:"id"`
 	Status  string  `json:"status"`
 	EndedAt *string `json:"ended_at,omitempty"`
 }
 
-// writeSessionEndJSON prints one session end JSON payload to stdout.
-func writeSessionEndJSON(value sessionEndJSON) {
+// writeSessionEndJSON prints one session end JSON payload — the single-end
+// struct or a bulk map — to stdout.
+func writeSessionEndJSON(value any) {
 	out, err := jsonMarshalIndent(value, "", "  ")
 	if err != nil {
 		fatal(err)
@@ -202,4 +302,53 @@ func cmdSessionEndSingle(cfg store.Config, parsed sessionEndArgs) {
 		return
 	}
 	fmt.Printf("Session %q ended\n", parsed.sessionID)
+}
+
+// cmdSessionEndBulk previews (dry-run, the default) or ends every open session
+// matching the staleness filters. The dry-run lists what would end and mutates
+// nothing; only --apply persists the ends.
+func cmdSessionEndBulk(cfg store.Config, parsed sessionEndArgs) {
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer func() { _ = s.Close() }()
+
+	now := time.Now()
+	if !parsed.apply {
+		stale, err := storeStaleOpenSessions(s, now, parsed.olderThan, parsed.project)
+		if err != nil {
+			fatal(err)
+			return
+		}
+		if parsed.jsonOut {
+			ids := make([]string, 0, len(stale))
+			for _, sess := range stale {
+				ids = append(ids, sess.ID)
+			}
+			writeSessionEndJSON(map[string]any{"dry_run": true, "would_end": ids, "count": len(ids)})
+			return
+		}
+		fmt.Printf("DRY RUN — %d session(s) would be ended:\n", len(stale))
+		for _, sess := range stale {
+			fmt.Printf("  %s  project=%s  directory=%s  started=%s  last activity=%s\n", sess.ID, sess.Project, sess.Directory, sess.StartedAt, sess.LastActivity)
+		}
+		fmt.Println("re-run with --apply to end them")
+		return
+	}
+
+	ids, err := storeEndSessionsBulk(s, now, parsed.olderThan, parsed.project)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if parsed.jsonOut {
+		writeSessionEndJSON(map[string]any{"ended": ids, "count": len(ids)})
+		return
+	}
+	fmt.Printf("Ended %d session(s):\n", len(ids))
+	for _, id := range ids {
+		fmt.Printf("  %s\n", id)
+	}
 }

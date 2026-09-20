@@ -265,6 +265,13 @@ engram delete prompt <id>
 engram delete project <name> [--hard]
                           Cascade-delete a project: soft-deletes observations (or hard-deletes
                           with --hard, which also removes sessions); always removes prompts
+engram session end <id>   End a session by ID [--summary TEXT] [--json] (immediate, idempotent;
+                          unknown IDs fail, already-ended sessions are a no-op notice)
+engram session end --by-age DURATION [--project NAME] [--apply] [--json]
+                          Bulk-end stale open sessions older than the window (dry-run
+                          preview by default; --apply persists; --project only narrows
+                          within the window). DURATION accepts Go syntax (72h) or
+                          compact forms (30d, 2w)
 engram timeline <obs_id>  Chronological context around an observation [--project P|--all]
 engram context [project]  Recent context from previous sessions [--project P|--all]
 engram stats              Memory statistics [--project P|--all]

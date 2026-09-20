@@ -3600,6 +3600,10 @@ Commands:
                      removes prompts; with --hard also removes sessions
   session end <id>   End a session by ID [--summary TEXT] [--json] (immediate, idempotent;
                      unknown IDs fail, already-ended sessions are a no-op notice)
+  session end [--by-age DURATION] [--project NAME] [--apply] [--json]
+                     Bulk-end stale open sessions matching the filters (dry-run
+                     preview by default; --apply persists). DURATION accepts Go
+                     syntax (72h) or compact forms (30d, 2w)
   timeline <obs_id>  Show chronological context around an observation [--before N] [--after N] [--project PROJECT|--all]
   conflicts <sub>   Inspect and manage memory conflict relations
                        list     [--project P]  [--status S]  [--since RFC3339]  [--limit N]

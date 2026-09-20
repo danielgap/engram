@@ -591,6 +591,36 @@ Inspect or replay the `sync_apply_deferred` queue.
 - `--inspect <sync_id>`: print full decoded payload for one row; exits non-zero when not found.
 - `--replay`: call `ReplayDeferred()` and print retried/succeeded/failed/dead counts.
 
+### Session End CLI
+
+`engram session end` closes sessions in the local store. For the session lifecycle over HTTP and what a session is, see [Sessions](#sessions).
+
+Single end (immediate, idempotent):
+
+```
+engram session end <id> [--summary TEXT] [--json]
+```
+
+- An unknown ID fails with exit code 1; an already-ended session is a no-op notice with exit code 0.
+- `--summary TEXT` stores a closing summary on the session row.
+- `--json` prints `{"id", "status", "ended_at"}`; `status` is `ended` or `already_ended`, and `ended_at` is read back from the store.
+
+Bulk end (dry-run first):
+
+```
+engram session end --by-age DURATION [--project NAME] [--apply] [--json]
+```
+
+- `--by-age DURATION` (required in bulk mode) selects open sessions whose effective last activity (the newest observation, falling back to `started_at`) is older than now minus the window. DURATION accepts Go syntax (`72h`) or compact forms (`30d`, `4w`).
+- `--project NAME` narrows the bulk match to one project (case-insensitive). It cannot widen it: `--project` without `--by-age` is rejected.
+- Without `--apply` the command is a dry-run: it lists the matched sessions and mutates nothing.
+- `--apply` ends every matched open session in one store transaction.
+- `--json` prints `{"dry_run": true, "would_end": [...], "count": N}` for a preview, or `{"ended": [...], "count": N}` with `--apply`.
+
+SAFETY PREVIEW: stale selection on this slice is time + project based only. Lease-aware exclusion of live sessions (an agent still actively recording inside the window) lands as a tracked follow-up; until then, scope `--apply` with `--project` and a generous window when agents may still be running.
+
+Recovery and rollback: one `--apply` batch commits atomically — either every matched session ends or none does. Ending is metadata, not deletion: session rows keep their observations, and one sync journal entry is emitted per ended session so cloud mirrors observe the ends. There is no bulk un-end; a wrongly ended session must be restored individually.
+
 ### Cloud CLI (opt-in)
 
 - `engram cloud status` — show current cloud config state plus auth/sync readiness without mutating local state. When cloud is configured, also probes the local `engram serve` daemon at `127.0.0.1:7437` (respects `ENGRAM_PORT`) and prints a `Local daemon:` line (`running` / `not running` / `unreachable`) so you can detect a silently dead autosync. The probe currently uses the TCP daemon endpoint, so `ENGRAM_SOCKET` socket-only mode can report the daemon as not running. Exit code is unaffected; the line is informational

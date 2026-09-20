@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Gentleman-Programming/engram/v2/internal/store"
 )
@@ -32,13 +33,63 @@ func TestParseSessionEndArgs(t *testing.T) {
 			want: sessionEndArgs{sessionID: "sess-1", summary: "done", hasSummary: true},
 		},
 		{
+			name: "bulk with age filter only",
+			args: []string{"--by-age", "72h"},
+			want: sessionEndArgs{olderThan: 72 * time.Hour, hasByAge: true},
+		},
+		{
+			name:    "bulk with project filter only requires an explicit window",
+			args:    []string{"--project", "web"},
+			wantErr: "requires --by-age",
+		},
+		{
+			name: "bulk with project narrowed by an explicit window",
+			args: []string{"--project", "web", "--by-age", "30d"},
+			want: sessionEndArgs{olderThan: 30 * 24 * time.Hour, hasByAge: true, project: "web"},
+		},
+		{
+			name: "bulk with every flag",
+			args: []string{"--by-age", "30d", "--project", "web", "--apply", "--json"},
+			want: sessionEndArgs{olderThan: 30 * 24 * time.Hour, hasByAge: true, project: "web", apply: true, jsonOut: true},
+		},
+		{
+			name:    "no session id",
+			args:    []string{},
+			wantErr: "session ID",
+		},
+		{
+			name:    "id and filter are mutually exclusive",
+			args:    []string{"sess-1", "--by-age", "72h"},
+			wantErr: "mutually exclusive",
+		},
+		{
+			name:    "id and project are mutually exclusive",
+			args:    []string{"sess-1", "--project", "web"},
+			wantErr: "mutually exclusive",
+		},
+		{
+			name:    "--apply with id",
+			args:    []string{"sess-1", "--apply"},
+			wantErr: "only valid",
+		},
+		{
 			name: "single session id with json",
 			args: []string{"sess-1", "--json"},
 			want: sessionEndArgs{sessionID: "sess-1", jsonOut: true},
 		},
 		{
-			name:    "no session id",
-			args:    []string{},
+			name:    "--summary with bulk filters",
+			args:    []string{"--by-age", "72h", "--summary", "done"},
+			wantErr: "only valid",
+		},
+		{
+			name:    "--apply without filters",
+			args:    []string{"--apply"},
+			wantErr: "session ID",
+		},
+		{
+			name:    "--json without filters",
+			args:    []string{"--json"},
 			wantErr: "session ID",
 		},
 		{
@@ -57,8 +108,23 @@ func TestParseSessionEndArgs(t *testing.T) {
 			wantErr: "--summary requires a value",
 		},
 		{
+			name:    "--by-age missing value",
+			args:    []string{"--by-age"},
+			wantErr: "--by-age requires a value",
+		},
+		{
+			name:    "--project missing value",
+			args:    []string{"--project"},
+			wantErr: "--project requires a value",
+		},
+		{
 			name:    "--summary value that looks like a flag",
 			args:    []string{"sess-1", "--summary", "--json"},
+			wantErr: "--summary requires a value",
+		},
+		{
+			name:    "--summary value that looks like the --apply flag",
+			args:    []string{"sess-1", "--summary", "--apply"},
 			wantErr: "--summary requires a value",
 		},
 		{
@@ -70,6 +136,36 @@ func TestParseSessionEndArgs(t *testing.T) {
 			name:    "--summary whitespace-only value",
 			args:    []string{"sess-1", "--summary", "   "},
 			wantErr: "--summary requires a value",
+		},
+		{
+			name:    "--project value that looks like a flag",
+			args:    []string{"sess-1", "--project", "--json"},
+			wantErr: "--project requires a value",
+		},
+		{
+			name:    "--project empty value",
+			args:    []string{"--by-age", "30d", "--project", ""},
+			wantErr: "--project requires a value",
+		},
+		{
+			name:    "--project whitespace-only value",
+			args:    []string{"--by-age", "30d", "--project", "  "},
+			wantErr: "--project requires a value",
+		},
+		{
+			name:    "garbage duration",
+			args:    []string{"--by-age", "soon"},
+			wantErr: "invalid --by-age value",
+		},
+		{
+			name:    "zero duration",
+			args:    []string{"--by-age", "0"},
+			wantErr: "invalid --by-age value",
+		},
+		{
+			name:    "negative duration",
+			args:    []string{"--by-age", "-1h"},
+			wantErr: "invalid --by-age value",
 		},
 	}
 	for _, tc := range tests {
@@ -86,6 +182,41 @@ func TestParseSessionEndArgs(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("parseSessionEndArgs(%v) = %+v, want %+v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseSessionEndAge(t *testing.T) {
+	tests := []struct {
+		value    string
+		want     time.Duration
+		wantText string
+	}{
+		{value: "72h", want: 72 * time.Hour},
+		{value: "45m", want: 45 * time.Minute},
+		{value: "1h30m", want: 90 * time.Minute},
+		{value: "30d", want: 30 * 24 * time.Hour},
+		{value: "2w", want: 14 * 24 * time.Hour},
+		{value: "", wantText: "invalid duration"},
+		{value: "soon", wantText: "invalid duration"},
+		{value: "30x", wantText: "invalid duration"},
+		{value: "d", wantText: "invalid duration"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.value, func(t *testing.T) {
+			got, err := parseSessionEndAge(tc.value)
+			if tc.wantText != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantText) {
+					t.Fatalf("parseSessionEndAge(%q) error = %v, want containing %q", tc.value, err, tc.wantText)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseSessionEndAge(%q): %v", tc.value, err)
+			}
+			if got != tc.want {
+				t.Fatalf("parseSessionEndAge(%q) = %v, want %v", tc.value, got, tc.want)
 			}
 		})
 	}
@@ -111,6 +242,21 @@ func seedEndedSession(t *testing.T, cfg store.Config, sessionID, project string)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
+	}
+}
+
+// seedStaleSession seeds an open session whose started_at is backdated, so
+// staleness windows keyed on real wall-clock time can select it.
+func seedStaleSession(t *testing.T, cfg store.Config, sessionID, project string, startedAt time.Time) {
+	t.Helper()
+	mustSeedSession(t, cfg, sessionID, project)
+	db, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, startedAt.UTC().Format("2006-01-02 15:04:05"), sessionID); err != nil {
+		t.Fatalf("backdate session %s: %v", sessionID, err)
 	}
 }
 
@@ -346,15 +492,128 @@ func TestCmdSessionEndSingle(t *testing.T) {
 	})
 }
 
+func TestCmdSessionEndBulkDryRunLeavesSessionsOpen(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Now()
+	seedStaleSession(t, cfg, "bulk-dry-a", "proj-dry", now.Add(-45*24*time.Hour))
+	seedStaleSession(t, cfg, "bulk-dry-b", "proj-dry", now.Add(-40*24*time.Hour))
+	seedStaleSession(t, cfg, "bulk-dry-fresh", "proj-dry", now.Add(-time.Hour))
+
+	withArgs(t, "engram", "session", "end", "--by-age", "30d")
+	stdout, stderr := captureOutput(t, func() { cmdSession(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "DRY RUN — 2 session(s) would be ended:") {
+		t.Fatalf("expected dry-run header in stdout, got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "re-run with --apply to end them") {
+		t.Fatalf("expected dry-run hint in stdout, got: %q", stdout)
+	}
+	for _, id := range []string{"bulk-dry-a", "bulk-dry-b"} {
+		if !strings.Contains(stdout, id) {
+			t.Fatalf("expected %s listed in dry-run output, got: %q", id, stdout)
+		}
+	}
+	if got := mustQueryCount(t, cfg, `SELECT COUNT(*) FROM sessions WHERE ended_at IS NOT NULL`); got != 0 {
+		t.Fatalf("dry-run ended %d rows, want 0", got)
+	}
+}
+
+func TestCmdSessionEndBulkApplyEndsStale(t *testing.T) {
+	cfg := testConfig(t)
+	now := time.Now()
+	seedStaleSession(t, cfg, "bulk-app-a", "proj-app", now.Add(-45*24*time.Hour))
+	seedStaleSession(t, cfg, "bulk-app-b", "proj-other", now.Add(-40*24*time.Hour))
+	seedStaleSession(t, cfg, "bulk-app-fresh", "proj-app", now.Add(-time.Hour))
+
+	withArgs(t, "engram", "session", "end", "--by-age", "30d", "--project", "proj-app", "--apply")
+	stdout, stderr := captureOutput(t, func() { cmdSession(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Ended 1 session(s)") {
+		t.Fatalf("expected ended count in stdout, got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "bulk-app-a") {
+		t.Fatalf("expected ended id in stdout, got: %q", stdout)
+	}
+	if got := mustQueryCount(t, cfg, `SELECT COUNT(*) FROM sessions WHERE id = ? AND ended_at IS NOT NULL`, "bulk-app-a"); got != 1 {
+		t.Fatalf("bulk-app-a ended rows = %d, want 1", got)
+	}
+	if got := mustQueryCount(t, cfg, `SELECT COUNT(*) FROM sessions WHERE ended_at IS NOT NULL`); got != 1 {
+		t.Fatalf("total ended rows = %d, want only the project match", got)
+	}
+}
+
+func TestCmdSessionEndBulkJSON(t *testing.T) {
+	t.Run("dry-run json reports what would end", func(t *testing.T) {
+		cfg := testConfig(t)
+		now := time.Now()
+		seedStaleSession(t, cfg, "json-dry-a", "proj-json", now.Add(-45*24*time.Hour))
+		seedStaleSession(t, cfg, "json-dry-b", "proj-json", now.Add(-40*24*time.Hour))
+
+		withArgs(t, "engram", "session", "end", "--by-age", "30d", "--json")
+		stdout, stderr := captureOutput(t, func() { cmdSession(cfg) })
+		if stderr != "" {
+			t.Fatalf("expected no stderr, got: %q", stderr)
+		}
+		var payload struct {
+			DryRun   bool     `json:"dry_run"`
+			WouldEnd []string `json:"would_end"`
+			Count    int      `json:"count"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+			t.Fatalf("invalid dry-run JSON %q: %v", stdout, err)
+		}
+		if !payload.DryRun || payload.Count != 2 || !reflect.DeepEqual(payload.WouldEnd, []string{"json-dry-a", "json-dry-b"}) {
+			t.Fatalf("dry-run JSON = %+v", payload)
+		}
+		if got := mustQueryCount(t, cfg, `SELECT COUNT(*) FROM sessions WHERE ended_at IS NOT NULL`); got != 0 {
+			t.Fatalf("dry-run ended %d rows, want 0", got)
+		}
+	})
+
+	t.Run("apply json reports what ended", func(t *testing.T) {
+		cfg := testConfig(t)
+		now := time.Now()
+		seedStaleSession(t, cfg, "json-app-a", "proj-json", now.Add(-45*24*time.Hour))
+
+		withArgs(t, "engram", "session", "end", "--by-age", "30d", "--json", "--apply")
+		stdout, stderr := captureOutput(t, func() { cmdSession(cfg) })
+		if stderr != "" {
+			t.Fatalf("expected no stderr, got: %q", stderr)
+		}
+		var payload struct {
+			Ended []string `json:"ended"`
+			Count int      `json:"count"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+			t.Fatalf("invalid apply JSON %q: %v", stdout, err)
+		}
+		if payload.Count != 1 || !reflect.DeepEqual(payload.Ended, []string{"json-app-a"}) {
+			t.Fatalf("apply JSON = %+v", payload)
+		}
+		if got := mustQueryCount(t, cfg, `SELECT COUNT(*) FROM sessions WHERE ended_at IS NOT NULL`); got != 1 {
+			t.Fatalf("ended rows = %d, want 1", got)
+		}
+	})
+}
+
 func TestCmdSessionEndRejectsInvalidInvocationsBeforeStoreOpen(t *testing.T) {
 	tests := []struct {
 		name    string
 		args    []string
 		wantErr string
 	}{
+		{name: "id with bulk filter", args: []string{"end", "sess-1", "--by-age", "72h"}, wantErr: "mutually exclusive"},
+		{name: "apply without filters", args: []string{"end", "--apply"}, wantErr: "session ID"},
 		{name: "unknown flag", args: []string{"end", "sess-1", "--sumary", "x"}, wantErr: "unknown flag"},
-		{name: "summary missing value", args: []string{"end", "sess-1", "--summary"}, wantErr: "--summary requires a value"},
-		{name: "summary value that looks like a flag", args: []string{"end", "sess-1", "--summary", "--json"}, wantErr: "--summary requires a value"},
+		{name: "apply with id", args: []string{"end", "sess-1", "--apply"}, wantErr: "only valid"},
+		{name: "garbage duration", args: []string{"end", "--by-age", "soon"}, wantErr: "invalid --by-age value"},
+		{name: "summary value that looks like a flag", args: []string{"end", "sess-1", "--summary", "--apply"}, wantErr: "--summary requires a value"},
+		{name: "bulk project without an explicit window", args: []string{"end", "--project", "web"}, wantErr: "requires --by-age"},
+		{name: "bulk project with apply but no window", args: []string{"end", "--project", "web", "--apply"}, wantErr: "requires --by-age"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -416,7 +675,9 @@ func TestCmdSessionDispatch(t *testing.T) {
 
 func TestSessionEndInUsage(t *testing.T) {
 	stdout, _ := captureOutput(t, func() { printUsage() })
-	if !strings.Contains(stdout, "session end <id>") {
-		t.Fatalf("expected %q in usage output, got:\n%s", "session end <id>", stdout)
+	for _, want := range []string{"session end <id>", "--by-age"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected %q in usage output, got:\n%s", want, stdout)
+		}
 	}
 }
