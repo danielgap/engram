@@ -9,6 +9,16 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 baseline="${DEADCODE_RATCHET_BASELINE:-${repo_root}/.deadcode-baseline.txt}"
 analyzer_version="v0.30.0"
 
+# The analyzer is built outside the module (path@version), so the default Go
+# toolchain compiles it even when it is older than go.mod's directive; that
+# analyzer then fails on every package with "package requires newer Go
+# version" and the ratchet aborts. Pin the toolchain to go.mod's directive
+# unless the caller already chose one.
+go_directive="$(sed -nE 's/^go ([0-9][0-9.]*)\s*$/\1/p' "${repo_root}/go.mod" | head -1)"
+if [[ -n "${go_directive}" && -z "${GOTOOLCHAIN:-}" ]]; then
+	export GOTOOLCHAIN="go${go_directive}"
+fi
+
 usage() {
 	cat <<'EOF'
 Usage: scripts/deadcode-ratchet.sh [--update | --compare <baseline> <candidate>]
