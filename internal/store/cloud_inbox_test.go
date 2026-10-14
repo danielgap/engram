@@ -193,29 +193,8 @@ func TestLocalCloudJournalWritesRequireEnrollmentAndBackfillCurrentState(t *test
 		t.Fatalf("add prompt before enrollment: %v", err)
 	}
 	var before int
-	// Unenrolled local writes stage in the cloud inbox; the delivery lane stays
-	// empty until enrollment backfills it.
-	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations WHERE target_key = ? AND project = ? AND acked_at IS NULL`, DefaultSyncTargetKey, project).Scan(&before); err != nil || before != 0 {
-		t.Fatalf("delivery-lane mutations before enrollment = %d (err %v), want 0", before, err)
-	}
-	inboxRows, err := s.db.Query(`SELECT op FROM sync_mutations WHERE target_key = ? AND project = ? AND acked_at IS NULL`, SyncInboxTargetKey, project)
-	if err != nil {
-		t.Fatalf("read inbox rows: %v", err)
-	}
-	inboxOps := map[string]int{}
-	for inboxRows.Next() {
-		var op string
-		if err := inboxRows.Scan(&op); err != nil {
-			t.Fatal(err)
-		}
-		inboxOps[op]++
-	}
-	if err := inboxRows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	inboxRows.Close()
-	if len(inboxOps) != 1 || inboxOps[SyncOpUpsert] != 1 {
-		t.Fatalf("pre-enrollment inbox rows = %v, want one observation upsert", inboxOps)
+	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations WHERE project = ? AND acked_at IS NULL`, project).Scan(&before); err != nil || before != 0 {
+		t.Fatalf("pending mutations before enrollment = %d (err %v), want 0", before, err)
 	}
 
 	if err := s.EnrollProject(project); err != nil {
@@ -230,15 +209,9 @@ func TestLocalCloudJournalWritesRequireEnrollmentAndBackfillCurrentState(t *test
 
 	for entity, want := range map[string]int{SyncEntitySession: 1, SyncEntityObservation: 2, SyncEntityPrompt: 2} {
 		var got int
-		if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations WHERE target_key = ? AND project = ? AND entity = ? AND acked_at IS NULL`, DefaultSyncTargetKey, project, entity).Scan(&got); err != nil || got != want {
-			t.Fatalf("delivery-lane %s mutations = %d (err %v), want %d", entity, got, err, want)
+		if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations WHERE project = ? AND entity = ? AND acked_at IS NULL`, project, entity).Scan(&got); err != nil || got != want {
+			t.Fatalf("pending %s mutations = %d (err %v), want %d", entity, got, err, want)
 		}
-	}
-	// The map and the inbox lane govern future derivation only: the staged
-	// pre-enrollment row keeps its original project and target.
-	var staged int
-	if err := s.db.QueryRow(`SELECT count(*) FROM sync_mutations WHERE target_key = ? AND project = ? AND op = ?`, SyncInboxTargetKey, project, SyncOpUpsert).Scan(&staged); err != nil || staged != 1 {
-		t.Fatalf("staged inbox rows after enrollment = %d (err %v), want 1 (no history rewrite)", staged, err)
 	}
 }
 func TestListSyncStatesReportsLifecycleAndUnackedCounts(t *testing.T) {

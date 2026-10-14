@@ -11275,30 +11275,8 @@ func TestUnenrolledHardDeletesReplayAfterReenrollment(t *testing.T) {
 		if err := s.DeleteObservation(observationID, true); err != nil {
 			t.Fatal(err)
 		}
-		// Unenrolled observation history now journals to the cloud inbox: the
-		// pre-enrollment upsert and the hard delete. The delivery lane stays
-		// empty until enrollment backfills it.
-		if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_mutations WHERE target_key = ?`, DefaultSyncTargetKey); got != 0 {
-			t.Fatalf("unenrolled hard delete wrote %d delivery-lane mutations, want 0", got)
-		}
-		inboxOps := map[string]int{}
-		rows, err := s.db.Query(`SELECT op FROM sync_mutations WHERE target_key = ?`, SyncInboxTargetKey)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for rows.Next() {
-			var op string
-			if err := rows.Scan(&op); err != nil {
-				t.Fatal(err)
-			}
-			inboxOps[op]++
-		}
-		if err := rows.Err(); err != nil {
-			t.Fatal(err)
-		}
-		rows.Close()
-		if inboxOps[SyncOpUpsert] != 1 || inboxOps[SyncOpDelete] != 1 {
-			t.Fatalf("inbox mutations = %v, want one upsert and one delete", inboxOps)
+		if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_mutations`); got != 0 {
+			t.Fatalf("unenrolled hard delete wrote %d sync mutations, want 0", got)
 		}
 
 		if err := s.EnrollProject(project); err != nil {

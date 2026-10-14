@@ -2,7 +2,6 @@ package store
 
 import (
 	"database/sql"
-	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -173,66 +172,33 @@ func countSyncMutationsWhere(t *testing.T, s *Store, where string, args ...any) 
 	return count
 }
 
-func TestUnenrolledObservationJournalsToCloudInbox(t *testing.T) {
+// Unenrolled writes keep main's enrollment gate: local records stay durable,
+// nothing is journaled, and enrollment backfills current state. Inbox enqueue
+// is deferred until the inbox has a reader (list/claim/drop).
+func TestUnenrolledObservationJournalsNothing(t *testing.T) {
 	s := newTestStore(t)
-	if err := s.CreateSession("inbox-obs-session", "unenrolled-proj", "/tmp/inbox-obs"); err != nil {
+	if err := s.CreateSession("unenrolled-obs-session", "unenrolled-proj", "/tmp/unenrolled-obs"); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	obsID, err := s.AddObservation(AddObservationParams{
-		SessionID: "inbox-obs-session",
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "unenrolled-obs-session",
 		Type:      "decision",
-		Title:     "inbox routing",
+		Title:     "local only",
 		Content:   "local observation",
 		Project:   "unenrolled-proj",
 		Scope:     "project",
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("add observation: %v", err)
 	}
-	if got := countSyncMutationsWhere(t, s, `target_key = ?`, DefaultSyncTargetKey); got != 0 {
-		t.Fatalf("legacy cloud rows for unenrolled observation = %d, want 0", got)
+	if got := countSyncMutationsWhere(t, s, `1=1`); got != 0 {
+		t.Fatalf("unenrolled observation journaled %d mutations, want 0", got)
 	}
-	if got := countSyncMutationsWhere(t, s, `target_key = ?`, SyncInboxTargetKey); got != 1 {
-		t.Fatalf("inbox rows = %d, want 1", got)
-	}
-	var entity, op, source, project, payload string
-	if err := s.db.QueryRow(`SELECT entity, op, source, project, payload FROM sync_mutations WHERE target_key = ?`, SyncInboxTargetKey).
-		Scan(&entity, &op, &source, &project, &payload); err != nil {
-		t.Fatalf("read inbox mutation: %v", err)
-	}
-	if entity != SyncEntityObservation || op != SyncOpUpsert || source != SyncSourceLocal {
-		t.Fatalf("inbox mutation = %s/%s/%s, want observation/upsert/local", entity, op, source)
-	}
-	if project != "unenrolled-proj" {
-		t.Fatalf("inbox project column = %q, want %q", project, "unenrolled-proj")
-	}
-	var decoded struct {
-		SyncID   string `json:"sync_id"`
-		Title    string `json:"title"`
-		Project  string `json:"project"`
-		Original bool   `json:"original"`
-	}
-	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
-		t.Fatalf("decode inbox payload: %v", err)
-	}
-	if decoded.Title != "inbox routing" || decoded.Project != "unenrolled-proj" {
-		t.Fatalf("payload was rewritten: %s", payload)
-	}
-	var syncID string
-	if err := s.db.QueryRow(`SELECT sync_id FROM observations WHERE id = ?`, obsID).Scan(&syncID); err != nil {
-		t.Fatalf("read observation sync id: %v", err)
-	}
-	if decoded.SyncID != syncID {
-		t.Fatalf("payload sync_id = %q, want %q", decoded.SyncID, syncID)
-	}
-	// No unenrolled per-project state may be minted, and the inbox lifecycle
-	// row must stay untouched.
 	var minted int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_state WHERE target_key = ?`, syncTargetKeyForProject("unenrolled-proj")).Scan(&minted); err != nil {
 		t.Fatal(err)
 	}
 	if minted != 0 {
-		t.Fatal("unenrolled project state row was minted by inbox routing")
+		t.Fatal("unenrolled project state row was minted by an unenrolled write")
 	}
 	state, err := s.GetSyncState(SyncInboxTargetKey)
 	if err != nil {
@@ -256,8 +222,22 @@ func TestUnenrolledTelemetryDoesNotJournalAtAll(t *testing.T) {
 	}
 }
 
-func TestSessionProjectFallbackRoutesToInbox(t *testing.T) {
+// deliveryLaneProject returns the project column of the delivery-lane row
+// journaled for entityKey, failing when the row is missing.
+func deliveryLaneProject(t *testing.T, s *Store, entityKey string) string {
+	t.Helper()
+	var project string
+	if err := s.db.QueryRow(`SELECT project FROM sync_mutations WHERE target_key = ? AND entity_key = ?`, DefaultSyncTargetKey, entityKey).Scan(&project); err != nil {
+		t.Fatalf("read delivery-lane mutation %q: %v", entityKey, err)
+	}
+	return project
+}
+
+func TestSessionProjectFallbackRoutesToDeliveryLane(t *testing.T) {
 	s := newTestStore(t)
+	if err := s.EnrollProject("sess-proj"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
 	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('fallback-session', 'sess-proj', '/tmp/fallback')`); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -274,18 +254,17 @@ func TestSessionProjectFallbackRoutesToInbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	var project string
-	if err := s.db.QueryRow(`SELECT project FROM sync_mutations WHERE target_key = ? AND entity_key = ?`, SyncInboxTargetKey, "fallback-obs").Scan(&project); err != nil {
-		t.Fatalf("read inbox mutation: %v", err)
-	}
-	if project != "sess-proj" {
-		t.Fatalf("inbox project = %q, want session-derived %q", project, "sess-proj")
+	if project := deliveryLaneProject(t, s, "fallback-obs"); project != "sess-proj" {
+		t.Fatalf("delivery-lane project = %q, want session-derived %q", project, "sess-proj")
 	}
 }
 
-func TestGitRootSlugRoutesUnenrolledToInbox(t *testing.T) {
+func TestGitRootSlugRoutesToDeliveryLane(t *testing.T) {
 	s := newTestStore(t)
 	repoDir := initGitRepo(t, "My_Repo Name")
+	if err := s.EnrollProject("my-repo-name"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
 	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('slug-session', '', ?)`, repoDir); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -302,16 +281,14 @@ func TestGitRootSlugRoutesUnenrolledToInbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	var project string
-	if err := s.db.QueryRow(`SELECT project FROM sync_mutations WHERE target_key = ? AND entity_key = ?`, SyncInboxTargetKey, "slug-obs").Scan(&project); err != nil {
-		t.Fatalf("read inbox mutation: %v", err)
-	}
-	if project != "my-repo-name" {
-		t.Fatalf("inbox project = %q, want git-root slug %q", project, "my-repo-name")
+	if project := deliveryLaneProject(t, s, "slug-obs"); project != "my-repo-name" {
+		t.Fatalf("delivery-lane project = %q, want git-root slug %q", project, "my-repo-name")
 	}
 }
 
-func TestNonRepoDirectoryRoutesUnsortedToInbox(t *testing.T) {
+// The basename fallback never produces a sync key: a non-repo directory with
+// no designation derives no candidate, so no row carries the basename.
+func TestNonRepoDirectoryDerivesNoSyncKey(t *testing.T) {
 	s := newTestStore(t)
 	plainDir := t.TempDir()
 	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES ('unsorted-session', '', ?)`, plainDir); err != nil {
@@ -330,17 +307,21 @@ func TestNonRepoDirectoryRoutesUnsortedToInbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	var project string
-	if err := s.db.QueryRow(`SELECT project FROM sync_mutations WHERE target_key = ? AND entity_key = ?`, SyncInboxTargetKey, "unsorted-obs").Scan(&project); err != nil {
-		t.Fatalf("read inbox mutation: %v", err)
+	if got := countSyncMutationsWhere(t, s, `project <> ''`); got != 0 {
+		t.Fatalf("non-repo write derived %d keyed rows, want 0", got)
 	}
-	if project != SyncInboxUnsortedProject {
-		t.Fatalf("inbox project = %q, want %q", project, SyncInboxUnsortedProject)
+	if got := countSyncMutationsWhere(t, s, `target_key = ?`, SyncInboxTargetKey); got != 0 {
+		t.Fatalf("inbox rows = %d, want 0", got)
 	}
 }
 
-func TestAliasMapGovernsInboxRouting(t *testing.T) {
+func TestAliasMapGovernsDeliveryRouting(t *testing.T) {
 	s := newTestStore(t)
+	for _, project := range []string{"renamed-project", "cwd-project"} {
+		if err := s.EnrollProject(project); err != nil {
+			t.Fatalf("enroll %s: %v", project, err)
+		}
+	}
 	if err := s.RegisterSyncProjectAlias("old-name", "renamed-project"); err != nil {
 		t.Fatalf("register alias: %v", err)
 	}
@@ -360,11 +341,7 @@ func TestAliasMapGovernsInboxRouting(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("enqueue alias observation: %v", err)
 	}
-	var project string
-	if err := s.db.QueryRow(`SELECT project FROM sync_mutations WHERE target_key = ? AND entity_key = ?`, SyncInboxTargetKey, "alias-obs").Scan(&project); err != nil {
-		t.Fatalf("read inbox mutation: %v", err)
-	}
-	if project != "renamed-project" {
+	if project := deliveryLaneProject(t, s, "alias-obs"); project != "renamed-project" {
 		t.Fatalf("alias-routed project = %q, want %q", project, "renamed-project")
 	}
 
@@ -376,10 +353,7 @@ func TestAliasMapGovernsInboxRouting(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("enqueue cwd observation: %v", err)
 	}
-	if err := s.db.QueryRow(`SELECT project FROM sync_mutations WHERE target_key = ? AND entity_key = ?`, SyncInboxTargetKey, "cwd-obs").Scan(&project); err != nil {
-		t.Fatalf("read inbox mutation: %v", err)
-	}
-	if project != "cwd-project" {
+	if project := deliveryLaneProject(t, s, "cwd-obs"); project != "cwd-project" {
 		t.Fatalf("cwd-routed project = %q, want %q", project, "cwd-project")
 	}
 }

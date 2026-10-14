@@ -370,10 +370,6 @@ const (
 	// its own sync_state row and never represents an enrollable project.
 	SyncInboxTargetKey = "cloud:inbox"
 
-	// SyncInboxUnsortedProject is the inbox project column value for local
-	// mutations whose routing derivation produced no candidate key.
-	SyncInboxUnsortedProject = "unsorted"
-
 	// ReservedInboxProjectName is the project name the cloud inbox owns. Enrolling
 	// it is rejected because its cloud:<project> target key would collide with
 	// SyncInboxTargetKey.
@@ -11550,34 +11546,19 @@ func (s *Store) enqueueSyncMutationWithSourceTx(tx *sql.Tx, entity, entityKey, o
 	}
 
 	// ── Stage B: target resolution (local writes only) ───────────────────────
-	// (1) the alias map resolves renames and non-repo working directories;
-	// (2) an enrolled candidate keeps today's delivery lane; (3) everything
-	// else routes to the reserved cloud inbox — observations and relations are
-	// journaled there, telemetry is not journaled at all. Non-local sources
-	// keep today's behavior entirely.
+	// The alias map resolves renames and non-repo working directories before
+	// the enrollment gate below, so an alias of an enrolled project keeps its
+	// delivery lane. Non-local sources keep today's behavior entirely.
 	if source == SyncSourceLocal {
 		resolved, resolveErr := s.resolveSyncRoutingProjectTx(tx, project, sessionDirectory)
 		if resolveErr != nil {
 			return resolveErr
 		}
 		project = resolved
-		enrolled := false
-		if project != "" {
-			enrolled, err = isProjectEnrolledTx(tx, project)
-			if err != nil {
-				return err
-			}
-		}
-		if !enrolled {
-			if entity == SyncEntitySession || entity == SyncEntityPrompt {
-				// Unenrolled telemetry never journals, not even to the inbox.
-				return nil
-			}
-			inboxProject := project
-			if inboxProject == "" {
-				inboxProject = SyncInboxUnsortedProject
-			}
-			return s.journalInboxMutationTx(tx, entity, entityKey, op, encoded, source, inboxProject)
+		if project == "" && (entity == SyncEntitySession || entity == SyncEntityPrompt) {
+			// Telemetry without a resolvable project never journals; the
+			// enrollment gate below covers named unenrolled projects.
+			return nil
 		}
 	}
 	// Cloud journal delivery is opt-in per project. Local writes remain durable in
@@ -11712,19 +11693,6 @@ func (s *Store) resolveSyncRoutingProjectTx(tx *sql.Tx, candidate, sessionDirect
 		}
 	}
 	return candidate, nil
-}
-
-// journalInboxMutationTx journals one local unenrolled mutation to the
-// reserved cloud inbox target. The inbox owns its permanent bootstrap
-// sync_state row: no per-project state is minted and no delivery cursor
-// advances — the inbox delivery lane is a later slice.
-func (s *Store) journalInboxMutationTx(tx *sql.Tx, entity, entityKey, op string, payload []byte, source, project string) error {
-	_, err := s.execHook(tx,
-		`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		SyncInboxTargetKey, entity, entityKey, op, string(payload), source, project,
-	)
-	return err
 }
 
 func extractSessionIDFromPayload(payload any) string {
