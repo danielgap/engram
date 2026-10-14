@@ -1249,9 +1249,7 @@ func primeConnection(db *sql.DB) error {
 	})
 }
 
-// schemaVersion 2 adds sync_project_aliases, the cloud inbox routing alias
-// map (alias_key→project renames and cwd→project mappings).
-const schemaVersion = 2
+const schemaVersion = 1
 
 var migrateRunCount atomic.Int64
 var acquireStartupMigrationLock = acquireMigrationLock
@@ -1867,7 +1865,8 @@ func (s *Store) migrate() error {
 		SyncLifecycleInbox, SyncInboxTargetKey, SyncLifecycleInbox); err != nil {
 		return err
 	}
-	// Schema v2: the cloud inbox routing alias map. Two entry kinds share the
+	// The cloud inbox routing alias map: additive, so it needs no schema
+	// version bump (older binaries ignore it). Two entry kinds share the
 	// table: alias_key→project renames and cwd→project mappings for non-repo
 	// working directories. The map governs future derivation only — it never
 	// rewrites journaled history.
@@ -7292,7 +7291,14 @@ func (s *Store) GetSyncState(targetKey string) (*SyncState, error) {
 	if err := s.ensureSyncState(targetKey); err != nil {
 		return nil, err
 	}
-	return s.getSyncState(targetKey)
+	state, err := s.getSyncState(targetKey)
+	if isMissingSyncStateRow(err) {
+		// The mint guard refused the row (an unenrolled cloud:<project>
+		// target). Readers still see the idle state such a target has, without
+		// persisting a row.
+		return &SyncState{TargetKey: targetKey, Lifecycle: SyncLifecycleIdle}, nil
+	}
+	return state, err
 }
 
 func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMutation, error) {
@@ -8260,6 +8266,9 @@ func (s *Store) ApplyPulledMutationPreservingSyncState(targetKey string, mutatio
 func (s *Store) applyPulledMutation(targetKey string, mutation SyncMutation, preserveSyncState bool) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	return s.withTx(func(tx *sql.Tx) error {
+		if err := s.mintPulledSyncStateTx(tx, targetKey); err != nil {
+			return err
+		}
 		state, err := s.getSyncStateTx(tx, targetKey)
 		if err != nil {
 			return err
@@ -8603,10 +8612,10 @@ func (s *Store) ApplyPulledChunkForDomain(targetKey, chunkID string, mutations [
 	}
 
 	return s.withTx(func(tx *sql.Tx) error {
+		if err := s.mintPulledSyncStateTx(tx, targetKey); err != nil {
+			return err
+		}
 		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
-			if isMissingSyncStateRow(err) {
-				return nil
-			}
 			return err
 		}
 
@@ -10238,11 +10247,10 @@ func (s *Store) ensureSyncState(targetKey string) error {
 }
 
 // syncStateMintAllowed reports whether creating a sync_state row for targetKey
-// is allowed. Mint-on-read stays reserved for the fixed delivery targets — the
-// legacy cloud lane, the reserved cloud inbox, and local chunk targets — plus
-// cloud:<enrolled> project targets. Rows for unenrolled projects are never
-// minted on read or touch; the cloud inbox owns unenrolled journal routing
-// instead. isEnrolled is injected so transactional and database-backed callers
+// is allowed on local read and touch paths. Only cloud:<project> targets are
+// gated: rows for unenrolled projects are never minted on read or touch, since
+// the cloud inbox owns unenrolled journal routing instead. Every other target
+// keeps mint-on-read, and pulled data mints through mintPulledSyncStateTx. isEnrolled is injected so transactional and database-backed callers
 // share one rule.
 func syncStateMintAllowed(targetKey string, isEnrolled func(project string) (bool, error)) (bool, error) {
 	normalized := normalizeSyncTargetKey(targetKey)
@@ -10256,7 +10264,7 @@ func syncStateMintAllowed(targetKey string, isEnrolled func(project string) (boo
 		}
 		return isEnrolled(project)
 	}
-	return false, nil
+	return true, nil
 }
 
 // isMissingSyncStateRow reports whether err means the sync_state row does not
@@ -10419,6 +10427,17 @@ func (s *Store) getSyncState(targetKey string) (*SyncState, error) {
 		return nil, err
 	}
 	return &state, nil
+}
+
+// mintPulledSyncStateTx creates the sync_state row for a target that delivered
+// pulled data. The mint guard only refuses local read and touch paths: remote
+// data proves the target exists, and refusing its row would discard the pull.
+func (s *Store) mintPulledSyncStateTx(tx *sql.Tx, targetKey string) error {
+	_, err := s.execHook(tx,
+		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
+		targetKey, SyncLifecycleIdle,
+	)
+	return err
 }
 
 func (s *Store) getSyncStateTx(tx *sql.Tx, targetKey string) (*SyncState, error) {

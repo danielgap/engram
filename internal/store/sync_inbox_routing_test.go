@@ -3,16 +3,15 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 )
 
-// ─── D2: cloud inbox routing alias map (schema v2) ──────────────────────────
+// ─── D2: cloud inbox routing alias map (additive, no schema bump) ───────────
 
-func TestSyncProjectAliasTableMigratedWithSchemaV2(t *testing.T) {
+func TestSyncProjectAliasTableMigratedWithoutSchemaBump(t *testing.T) {
 	s := newTestStore(t)
 	var table string
 	if err := s.db.QueryRow(
@@ -24,11 +23,10 @@ func TestSyncProjectAliasTableMigratedWithSchemaV2(t *testing.T) {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
+	// The table is additive and ignored by older binaries, so it must not
+	// stamp a newer user_version that would make them report future_schema.
 	if version != schemaVersion {
 		t.Fatalf("user_version = %d, want %d", version, schemaVersion)
-	}
-	if schemaVersion < 2 {
-		t.Fatalf("schemaVersion = %d, want >= 2 for the inbox routing alias map", schemaVersion)
 	}
 }
 
@@ -489,8 +487,14 @@ func ptrString(v string) *string { return &v }
 func TestGetSyncStateDoesNotMintUnenrolledProjectTarget(t *testing.T) {
 	s := newTestStore(t)
 	target := syncTargetKeyForProject("mint-unenrolled")
-	if _, err := s.GetSyncState(target); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("GetSyncState(unenrolled) err = %v, want sql.ErrNoRows", err)
+	// Readers still see the idle state such a target has; only the row is
+	// never persisted.
+	state, err := s.GetSyncState(target)
+	if err != nil {
+		t.Fatalf("GetSyncState(unenrolled) error = %v, want an idle state", err)
+	}
+	if state == nil || state.TargetKey != target || state.Lifecycle != SyncLifecycleIdle {
+		t.Fatalf("GetSyncState(unenrolled) = %+v, want idle state for the target", state)
 	}
 	if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_state WHERE target_key = ?`, target); got != 0 {
 		t.Fatalf("unenrolled target rows after read = %d, want 0", got)
@@ -559,17 +563,26 @@ func TestRefreshProjectSyncStateSkipsAbsentUnenrolled(t *testing.T) {
 	}
 }
 
-func TestApplyPulledMutationRequiresExistingStateRow(t *testing.T) {
+// Pulled data proves its target exists: the mint guard only refuses local
+// read and touch paths, so a pull mints the row instead of being discarded.
+func TestApplyPulledMutationMintsTargetStateRow(t *testing.T) {
 	s := newTestStore(t)
 	target := syncTargetKeyForProject("pull-unenrolled")
-	err := s.ApplyPulledMutation(target, SyncMutation{
-		Seq: 1, Entity: SyncEntityObservation, EntityKey: "pull-key", Op: SyncOpUpsert, Payload: "{}",
-	})
-	if !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("ApplyPulledMutation without state row = %v, want sql.ErrNoRows", err)
+	if err := s.CreateSession("pull-session", "pull-unenrolled", "/tmp/pull-unenrolled"); err != nil {
+		t.Fatal(err)
 	}
-	if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_state WHERE target_key = ?`, target); got != 0 {
-		t.Fatalf("ApplyPulledMutation minted rows = %d, want 0", got)
+	err := s.ApplyPulledMutation(target, SyncMutation{
+		Seq: 1, Entity: SyncEntityObservation, EntityKey: "pull-key", Op: SyncOpUpsert,
+		Payload: `{"sync_id":"pull-key","session_id":"pull-session","type":"decision","title":"pulled","content":"body","project":"pull-unenrolled","scope":"project"}`,
+	})
+	if err != nil {
+		t.Fatalf("ApplyPulledMutation without state row = %v, want nil", err)
+	}
+	if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_state WHERE target_key = ?`, target); got != 1 {
+		t.Fatalf("ApplyPulledMutation state rows = %d, want 1", got)
+	}
+	if got := scalarInt(t, s, `SELECT COUNT(*) FROM observations WHERE sync_id = ?`, "pull-key"); got != 1 {
+		t.Fatalf("pulled observation rows = %d, want 1", got)
 	}
 }
 

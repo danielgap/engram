@@ -3259,8 +3259,12 @@ func TestCloudSyncPreflightBlocksUnenrolledBeforeTransport(t *testing.T) {
 	// The blocked-unenrolled preflight still blocks before any transport call,
 	// but it no longer mints a state row for the unenrolled project: the error
 	// is returned to the caller instead of being persisted.
-	if _, err := s.GetSyncState("cloud:proj-a"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("unenrolled preflight minted state: err=%v, want sql.ErrNoRows", err)
+	var rows int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_state WHERE target_key = ?`, "cloud:proj-a").Scan(&rows); err != nil {
+		t.Fatalf("count sync_state rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("unenrolled preflight minted %d state rows, want 0", rows)
 	}
 }
 

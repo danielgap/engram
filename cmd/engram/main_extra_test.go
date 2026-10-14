@@ -3568,8 +3568,12 @@ func TestCmdSyncCloudPreflightMissingServerMarksConfigError(t *testing.T) {
 	// The cloud_config_error still fails the command (asserted above), but the
 	// preflight for an unenrolled project must not mint a cloud:proj-a state
 	// row anymore — the error is returned, not persisted.
-	if _, err := s.GetSyncState(cloudTargetKeyForProject("proj-a")); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("preflight minted state for unenrolled project: err=%v, want sql.ErrNoRows", err)
+	var rows int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM sync_state WHERE target_key = ?`, cloudTargetKeyForProject("proj-a")).Scan(&rows); err != nil {
+		t.Fatalf("count sync_state rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("preflight minted %d state rows for unenrolled project, want 0", rows)
 	}
 }
 
